@@ -205,3 +205,8 @@ cython_debug/
 marimo/_static/
 marimo/_lsp/
 __marimo__/
+
+# Data files - exclude all data files from version control
+data/
+!data/*/README.md
+!data/README.md

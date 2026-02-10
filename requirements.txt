@@ -1,0 +1,5 @@
+numpy>=2.1.0
+pymzml
+pridepy
+tqdm
+pytest

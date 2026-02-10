@@ -1,0 +1,101 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Python Debugger: Current File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Build Foundation: pride-download",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/build_foundation_lcms.py",
+            "args": [
+                "pride-download",
+                "--pxd",
+                "PXD012353",
+                "--out",
+                "data/pride/PXD012353"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Build Foundation: massive-download",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/build_foundation_lcms.py",
+            "args": [
+                "massive-download",
+                "--msv",
+                "${input:msvAccession}",
+                "--out",
+                "data/massive/${input:msvAccession}"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Build Foundation: convert-raw",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/build_foundation_lcms.py",
+            "args": [
+                "convert-raw",
+                "--raw-dir",
+                "data/raw",
+                "--mzml-dir",
+                "data/interim/mzml"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Build Foundation: mzml-to-voxel",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/build_foundation_lcms.py",
+            "args": [
+                "mzml-to-voxel",
+                "--mzml-dir",
+                "data/interim/mzml",
+                "--voxel-dir",
+                "data/processed/voxel",
+                "--mz-bin",
+                "1.0",
+                "--mz-parent-bin",
+                "1.0",
+                "--rt-bin-sec",
+                "1.0"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Build Foundation: window",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${workspaceFolder}/build_foundation_lcms.py",
+            "args": [
+                "window",
+                "--voxel-dir",
+                "data/processed/voxel",
+                "--window-sec",
+                "30",
+                "--stride-sec",
+                "15"
+            ],
+            "console": "integratedTerminal"
+        }
+    ]
+    ,"inputs": [
+        {
+            "id": "msvAccession",
+            "type": "promptString",
+            "description": "MassIVE accession (e.g., MSV000012345)",
+            "default": "MSV000012345"
+        }
+    ]
+}
