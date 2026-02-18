@@ -3,8 +3,8 @@
 import argparse
 from pathlib import Path
 
-from foundationmsms.data.download import download_massive, download_pride
-from foundationmsms.preprocessing.windowing import make_rt_windows
+from ..data.download import download_massive, download_pride, download_priority_datasets, download_priority_missing
+from ..preprocessing.windowing import make_rt_windows
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -25,6 +25,22 @@ def build_parser() -> argparse.ArgumentParser:
     p3.add_argument("--window-sec", type=int, default=30)
     p3.add_argument("--stride-sec", type=int, default=15)
 
+    p4 = sub.add_parser("download-priority")
+    p4.add_argument("--config", type=Path, default=Path("configs/datasets.yaml"))
+    p4.add_argument("--out", type=Path, default=Path("data/raw"))
+    p4.add_argument("--priority", type=int, default=1)
+    p4.add_argument("--protocol", type=str, default="s3", help="PRIDE download protocol (s3 or ftp)")
+    p4.add_argument("--massive-host", type=str, default="massive-ftp.ucsd.edu")
+    p4.add_argument("--mode", type=str, default="DIA", help="Acquisition mode (subfolder under raw)")
+
+    p5 = sub.add_parser("download-priority-debug")
+    p5.add_argument("--config", type=Path, default=Path("configs/datasets.yaml"))
+    p5.add_argument("--out", type=Path, default=Path("data/raw"))
+    p5.add_argument("--priority", type=int, default=1)
+    p5.add_argument("--protocol", type=str, default="s3", help="PRIDE download protocol (s3 or ftp)")
+    p5.add_argument("--massive-host", type=str, default="massive-ftp.ucsd.edu")
+    p5.add_argument("--mode", type=str, default="DIA", help="Acquisition mode (subfolder under raw)")
+
     return ap
 
 
@@ -38,6 +54,22 @@ def main() -> None:
         download_massive(args.msv, Path(args.out))
     elif args.cmd == "window":
         make_rt_windows(Path(args.voxel_dir), window_sec=args.window_sec, stride_sec=args.stride_sec)
+    elif args.cmd == "download-priority":
+        download_priority_datasets(
+            Path(args.config),
+            Path(args.out) / args.mode,
+            priority=args.priority,
+            protocol=args.protocol,
+            massive_host=args.massive_host
+        )
+    elif args.cmd == "download-priority-debug":
+        download_priority_missing(
+            Path(args.config),
+            Path(args.out) / args.mode,
+            priority=args.priority,
+            protocol=args.protocol,
+            massive_host=args.massive_host
+        )
 
 
 if __name__ == "__main__":

@@ -103,3 +103,40 @@ def mzml_to_voxel_npz(
         vals = sums.astype(np.float32)
 
     np.savez_compressed(out_npz, coords=coords, vals=vals)
+
+
+def massive_mzml_to_voxel(
+    mzml_dir: Path,
+    voxel_dir: Path,
+    mz_bin: float = 1.0,
+    mz_parent_bin: float = 1.0,
+    rt_bin_sec: float = 1.0,
+    delete_mzml: bool = False,
+) -> None:
+    """
+    Convert all mzML files in mzml_dir to voxel npz files in voxel_dir.
+    Optionally delete mzML files after conversion.
+    """
+    from tqdm import tqdm
+
+    mzml_dir = Path(mzml_dir)
+    voxel_dir = Path(voxel_dir)
+    voxel_dir.mkdir(parents=True, exist_ok=True)
+    files = list(mzml_dir.rglob("*.mzML"))
+    for f in tqdm(files, desc="mzML->voxel (massive)"):
+        out = voxel_dir / (f.stem + ".npz")
+        try:
+            mzml_to_voxel_npz(
+                f,
+                out,
+                mz_bin=mz_bin,
+                mz_parent_bin=mz_parent_bin,
+                rt_bin_sec=rt_bin_sec,
+                rt_range_sec=None,
+                ms2_only=True,
+                intensity_transform="log1p",
+            )
+            if delete_mzml:
+                f.unlink()
+        except Exception as e:
+            print(f"[massive-mzml-to-voxel] Failed {f}: {e}")

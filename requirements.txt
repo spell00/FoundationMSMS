@@ -1,5 +1,7 @@
 numpy>=2.1.0
 pymzml
 pridepy
-tqdm
+tqdm>=4.66.0
 pytest
+pyyaml
+pridepy

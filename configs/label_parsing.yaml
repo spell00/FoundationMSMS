@@ -1,0 +1,13 @@
+# Label parsing rules per dataset.
+# Each entry defines how to split a filename to extract the classification label.
+# Fields:
+# - delimiter: character(s) to split on
+# - index: zero-based index to select after splitting
+# - truncate: optional number of leading characters to keep from the selected part
+# - example: optional example filename for clarity
+
+PXD012353:
+  delimiter: "_"
+  index: 4
+  truncate: 2
+  example: "02101a_GA1-TUM_proteo_TMT_1_01_01-2xIT_2xHCD-1h-R1.mzML"

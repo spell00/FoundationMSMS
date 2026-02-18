@@ -6,7 +6,7 @@ from typing import Iterable, Optional
 
 import numpy as np
 
-from foundationmsms.logging.logger import get_logger
+from ..logging.logger import get_logger
 
 
 @dataclass

@@ -1,0 +1,70 @@
+datasets:
+
+  - id: PXD050291
+    name: "Large-scale urinary proteomics DIA benchmark"
+    source: "ProteomeXchange"
+    acquisition:
+      mode: "DIA"
+      instrument: "Multiple high-resolution platforms (includes Orbitrap-class systems)"
+      lc_system: "Multiple"
+      gradient_minutes_min: 6
+    sample_type: "Urine"
+    purpose:
+      - "Increase urine biological variability"
+      - "Improve background/blank representation learning"
+      - "Enhance robustness to inter-instrument differences"
+    compatibility:
+      mz_tokenization: "Compatible (rebinned to canonical grid)"
+      rt_handling: "Windowed/cropped to target duration"
+    usage:
+      stage: "Representation pretraining / augmentation"
+      labels_used: false
+
+  - id: PXD047676
+    name: "DIA Exploris 480 Evosep dataset"
+    source: "ProteomeXchange"
+    acquisition:
+      mode: "DIA"
+      instrument: "Orbitrap Exploris 480"
+      lc_system: "Evosep One"
+      gradient_minutes_min: 6
+    sample_type: "Proteomics (non-urine)"
+    purpose:
+      - "Match acquisition characteristics of study data"
+      - "Learn DIA fragmentation structure"
+      - "Improve transfer to short-gradient workflows"
+    compatibility:
+      mz_tokenization: "Compatible (rebinned to canonical grid)"
+      rt_handling: "RT cropped or windowed"
+    usage:
+      stage: "Representation pretraining / augmentation"
+      labels_used: false
+
+
+  - id: PXD016662
+    name: "Short-gradient DIA benchmark dataset"
+    source: "ProteomeXchange"
+    acquisition:
+      mode: "DIA"
+      instrument: "High-resolution Orbitrap"
+      lc_system: "LC-MS/MS"
+      gradient_minutes_min: 6
+    sample_type: "Proteomics (non-urine)"
+    purpose:
+      - "Increase acquisition diversity"
+      - "Improve representation robustness"
+    compatibility:
+      mz_tokenization: "Compatible (rebinned to canonical grid)"
+      rt_handling: "RT windowing"
+    usage:
+      stage: "Representation pretraining / augmentation"
+      labels_used: false
+
+common_constraints:
+  acquisition_mode: "DIA only"
+  mz_tokenization: "Fixed canonical binning"
+  rt_strategy: "Windowed or cropped (>=6 minutes)"
+  excluded:
+    - "DDA datasets"
+    - "Targeted acquisition (PRM/SRM)"
+    - "Enrichment-specific workflows"
