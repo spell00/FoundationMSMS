@@ -4,4 +4,5 @@ pridepy
 tqdm>=4.66.0
 pytest
 pyyaml
+matplotlib
 pridepy

@@ -1,4 +1,23 @@
 datasets:
+  - id: msv000083793
+    name: "MassIVE msv000083793 benchmark dataset"
+    source: "MassIVE"
+    id_type: "MSV"
+    acquisition:
+      mode: "DIA"
+      instrument: "Q Exactive HF"
+      lc_system: "Thermo Easy-nLC"
+      gradient_minutes_min: 6
+    sample_type: "Proteomics (non-urine)"
+    purpose:
+      - "Benchmarking DIA workflows"
+      - "Cross-platform evaluation"
+    compatibility:
+      mz_tokenization: "Compatible (rebinned to canonical grid)"
+      rt_handling: "Windowed/cropped to target duration"
+    usage:
+      stage: "Representation pretraining / augmentation"
+      labels_used: false
 
   - id: PXD050291
     name: "Large-scale urinary proteomics DIA benchmark"

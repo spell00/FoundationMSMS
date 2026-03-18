@@ -1,0 +1,10 @@
+# Voxelization and windowing parameters — versioned source of truth.
+# These values define the representation grid used to build scenario files.
+# Update this file whenever preprocessing parameters change; it is automatically
+# read by the training script and logged to TensorBoard HParams / parallel coordinates.
+
+mz_bin: 1.0          # fragment m/z bin width (Da)
+mz_parent_bin: 1.0   # precursor m/z bin width (Da)
+rt_bin_sec: 1.0      # retention time bin width (seconds)
+window_sec: 30       # sliding window length (seconds)
+stride_sec: 15       # sliding window stride (seconds)

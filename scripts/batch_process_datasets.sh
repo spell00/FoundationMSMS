@@ -18,7 +18,7 @@ echo ""
 
 # Step 1: Batch download with parallel downloads
 echo "📥 Step 1: Downloading datasets (parallel=${PARALLEL})"
-python -u build_foundation_lcms.py batch-download \
+python -u -m foundationmsms.preprocessing batch-download \
     --max-priority ${MAX_PRIORITY} \
     --parallel ${PARALLEL} \
     --base-dir ${BASE_DIR} \
@@ -50,7 +50,7 @@ for dataset_path in ${BASE_DIR}/raw/pride/*/ ${BASE_DIR}/raw/massive/*/; do
                 cleanup_flags="$cleanup_flags --cleanup-mzml"
             fi
             
-            python -u build_foundation_lcms.py pipeline \
+            python -u -m foundationmsms.preprocessing pipeline \
                 --dataset-dir "$dataset_path" \
                 --output-base "$output_dir" \
                 $cleanup_flags \

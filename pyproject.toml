@@ -13,7 +13,18 @@ license = {file = "LICENSE"}
 dependencies = [
     "numpy",
     "torch",
+    "pyyaml",
+    "tqdm",
+    "matplotlib",
 ]
 
 [project.urls]
 Homepage = "https://example.com/foundationmsms"
+
+[project.scripts]
+lcms-download-voxelize = "foundationmsms.preprocessing.download_and_voxelize:main"
+lcms-add-labels = "foundationmsms.preprocessing.add_labels_to_scenario:main"
+lcms-build-scenario = "foundationmsms.preprocessing.build_scenario_from_voxel:main"
+lcms-optimize-hparams = "foundationmsms.preprocessing.optimize_hparams:main"
+lcms-voxelize-provenance = "foundationmsms.preprocessing.voxelize_with_provenance:main"
+lcms-build-paper = "foundationmsms.experiments.build_paper:main"

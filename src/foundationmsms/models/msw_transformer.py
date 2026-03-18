@@ -72,6 +72,7 @@ class ShiftedWindowSelfAttention(nn.Module):
             x = torch.roll(x, shifts=-self.shift_size, dims=1)
 
         windows, pad = _window_partition(x, self.window_size)
+        windows = windows.contiguous()
         attn_out, _ = self.attn(windows, windows, windows)
         x = _window_reverse(attn_out, self.window_size, b, l, pad)
 

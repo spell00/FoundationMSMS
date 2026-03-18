@@ -10,4 +10,11 @@ PXD012353:
   delimiter: "_"
   index: 4
   truncate: 2
-  example: "02101a_GA1-TUM_proteo_TMT_1_01_01-2xIT_2xHCD-1h-R1.mzML"
+  example: "20140103_Velos1_HRV_MV_DCmin1.npz"
+  clf_name: "WT"
+
+MSV000083793:
+  delimiter: "_"
+  index: 0
+  example: "CF_high_J3.npz"
+  clf_name: "bacteria"

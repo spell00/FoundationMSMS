@@ -8,7 +8,7 @@ for src in pride massive; do
     if [[ -d "$d" ]]; then
       dataset=$(basename "$d")
       out_dir="/home/simonp/FoundationMSMS/data/mzml/${src}/${dataset}"
-      /home/simonp/anaconda3/envs/foundationmsms/bin/python /home/simonp/FoundationMSMS/build_foundation_lcms.py convert-raw --raw-dir "$d" --mzml-dir "$out_dir"
+      python -m foundationmsms.preprocessing convert-raw --raw-dir "$d" --mzml-dir "$out_dir"
     fi
   done
 done

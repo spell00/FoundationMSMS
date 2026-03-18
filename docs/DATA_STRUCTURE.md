@@ -51,12 +51,12 @@ data/
 
 ```bash
 # Download
-python build_foundation_lcms.py pride-download \
+python -m foundationmsms.preprocessing pride-download \
     --pxd PXD012353 \
     --out data/raw/pride/PXD012353
 
 # Process (output-base is just "data", pipeline creates subdirs)
-python build_foundation_lcms.py pipeline \
+python -m foundationmsms.preprocessing pipeline \
     --dataset-dir data/raw/pride/PXD012353 \
     --output-base data \
     --cleanup-raw \
@@ -73,18 +73,18 @@ python build_foundation_lcms.py pipeline \
 With cleanup options:
 ```bash
 # Keep everything (for debugging)
-python build_foundation_lcms.py pipeline \
+python -m foundationmsms.preprocessing pipeline \
     --dataset-dir data/raw/pride/PXD012353 \
     --output-base data
 
 # Delete RAW after mzML conversion (save ~50%)
-python build_foundation_lcms.py pipeline \
+python -m foundationmsms.preprocessing pipeline \
     --dataset-dir data/raw/pride/PXD012353 \
     --output-base data \
     --cleanup-raw
 
 # Delete both RAW and mzML (save ~80-90%, keep only voxels)
-python build_foundation_lcms.py pipeline \
+python -m foundationmsms.preprocessing pipeline \
     --dataset-dir data/raw/pride/PXD012353 \
     --output-base data \
     --cleanup-raw \

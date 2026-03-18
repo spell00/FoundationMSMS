@@ -12,14 +12,14 @@ The batch processing system supports:
 
 ### 1. Download Priority 1 Datasets (parallel)
 ```bash
-python -u build_foundation_lcms.py batch-download \
+python -u -m foundationmsms.preprocessing batch-download \
     --max-priority 1 \
     --parallel 3
 ```
 
 ### 2. Run Full Pipeline on One Dataset
 ```bash
-python -u build_foundation_lcms.py pipeline \
+python -u -m foundationmsms.preprocessing pipeline \
     --dataset-dir data/pride/PXD012353 \
     --output-base data/processed/PXD012353 \
     --cleanup-raw \
@@ -48,13 +48,13 @@ Download multiple datasets from config with parallel support.
 **Examples:**
 ```bash
 # Download top 2 priority levels with 3 parallel downloads
-python build_foundation_lcms.py batch-download --max-priority 2 --parallel 3
+python -m foundationmsms.preprocessing batch-download --max-priority 2 --parallel 3
 
 # Download only PRIDE datasets
-python build_foundation_lcms.py batch-download --source pride
+python -m foundationmsms.preprocessing batch-download --source pride
 
 # Download specific datasets
-python build_foundation_lcms.py batch-download --id PXD012353 --id PXD010595
+python -m foundationmsms.preprocessing batch-download --id PXD012353 --id PXD010595
 ```
 
 ### pipeline
@@ -73,7 +73,7 @@ Run full processing pipeline: raw → mzml → voxel → windows.
 
 **Example:**
 ```bash
-python build_foundation_lcms.py pipeline \
+python -m foundationmsms.preprocessing pipeline \
     --dataset-dir data/pride/PXD012353 \
     --output-base data/processed/PXD012353 \
     --cleanup-raw \
@@ -86,28 +86,30 @@ python build_foundation_lcms.py pipeline \
 
 **Download single PRIDE dataset:**
 ```bash
-python build_foundation_lcms.py pride-download \
+python -m foundationmsms.preprocessing pride-download \
     --pxd PXD012353 \
     --out data/pride/PXD012353
 ```
 
 **Convert RAW to mzML:**
 ```bash
-python build_foundation_lcms.py convert-raw \
+python -m foundationmsms.preprocessing convert-raw \
     --raw-dir data/pride/PXD012353 \
     --mzml-dir data/mzml/PXD012353
 ```
 
-**Convert mzML to voxels:**
+**Convert mzML to voxels (parallel):**
 ```bash
-python build_foundation_lcms.py mzml-to-voxel \
+python -m foundationmsms.preprocessing mzml-to-voxel \
     --mzml-dir data/mzml/PXD012353 \
-    --voxel-dir data/voxel/PXD012353
+    --voxel-dir data/voxel/PXD012353 \
+    --workers 4
 ```
+Set --workers to the number of parallel processes you want (default is 1).
 
 **Create temporal windows:**
 ```bash
-python build_foundation_lcms.py window \
+python -m foundationmsms.preprocessing window \
     --voxel-dir data/voxel/PXD012353 \
     --window-sec 30 \
     --stride-sec 15
@@ -118,7 +120,7 @@ python build_foundation_lcms.py window \
 ### Strategy 1: Aggressive Cleanup
 Delete intermediate files immediately after processing:
 ```bash
-python build_foundation_lcms.py pipeline \
+python -m foundationmsms.preprocessing pipeline \
     --dataset-dir data/pride/PXD012353 \
     --output-base data/processed/PXD012353 \
     --cleanup-raw \
@@ -133,7 +135,7 @@ python build_foundation_lcms.py pipeline \
 ### Strategy 2: Keep mzML for Review
 Delete only RAW files:
 ```bash
-python build_foundation_lcms.py pipeline \
+python -m foundationmsms.preprocessing pipeline \
     --dataset-dir data/pride/PXD012353 \
     --output-base data/processed/PXD012353 \
     --cleanup-raw
@@ -142,7 +144,7 @@ python build_foundation_lcms.py pipeline \
 ### Strategy 3: Keep Everything
 No cleanup flags (useful for debugging):
 ```bash
-python build_foundation_lcms.py pipeline \
+python -m foundationmsms.preprocessing pipeline \
     --dataset-dir data/pride/PXD012353 \
     --output-base data/processed/PXD012353
 ```
@@ -152,7 +154,7 @@ python build_foundation_lcms.py pipeline \
 ### Example 1: Process Top Priority Datasets
 ```bash
 # Download priority 1 datasets (small size, many samples)
-python -u build_foundation_lcms.py batch-download \
+python -u -m foundationmsms.preprocessing batch-download \
     --max-priority 1 \
     --parallel 3 \
     --skip-existing
@@ -164,7 +166,7 @@ python -u build_foundation_lcms.py batch-download \
 ### Example 2: Selective Download and Process
 ```bash
 # Download specific datasets in parallel
-python build_foundation_lcms.py batch-download \
+python -m foundationmsms.preprocessing batch-download \
     --id PXD012353 \
     --id PXD010595 \
     --id PXD021874 \
@@ -172,7 +174,7 @@ python build_foundation_lcms.py batch-download \
 
 # Process each one
 for pxd in PXD012353 PXD010595 PXD021874; do
-    python build_foundation_lcms.py pipeline \
+    python -m foundationmsms.preprocessing pipeline \
         --dataset-dir data/pride/$pxd \
         --output-base data/processed/$pxd \
         --cleanup-raw --cleanup-mzml
@@ -182,12 +184,12 @@ done
 ### Example 3: Re-download Failed Dataset
 ```bash
 # Re-download specific dataset
-python build_foundation_lcms.py batch-download \
+python -m foundationmsms.preprocessing batch-download \
     --id PXD012353 \
     --reload
 
 # Process it
-python build_foundation_lcms.py pipeline \
+python -m foundationmsms.preprocessing pipeline \
     --dataset-dir data/pride/PXD012353 \
     --output-base data/processed/PXD012353 \
     --cleanup-raw --cleanup-mzml

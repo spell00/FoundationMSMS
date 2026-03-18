@@ -14,83 +14,261 @@
         {
             "name": "Build Foundation: pride-download",
             "type": "debugpy",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
             "request": "launch",
-            "program": "${workspaceFolder}/build_foundation_lcms.py",
+            "module": "foundationmsms.preprocessing",
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
             "args": [
                 "pride-download",
-                "--pxd",
-                "PXD012353",
-                "--out",
-                "data/pride/PXD012353"
+                "--pxd", "PXD047676",
+                "--out", "data/raw/pride/PXD047676"
+                //"--redownload"
             ],
             "console": "integratedTerminal"
         },
         {
-            "name": "Build Foundation: massive-download",
+            "name": "Build Foundation: massive-download-and-voxel",
             "type": "debugpy",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
             "request": "launch",
-            "program": "${workspaceFolder}/build_foundation_lcms.py",
+            "module": "foundationmsms.preprocessing",
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
             "args": [
-                "massive-download",
-                "--msv",
-                "${input:msvAccession}",
-                "--out",
-                "data/massive/${input:msvAccession}"
+                "massive-download-and-voxel",
+                "--msv", "MSV000083793",
+                "--type", "ccms_peak"
             ],
             "console": "integratedTerminal"
         },
         {
             "name": "Build Foundation: convert-raw",
             "type": "debugpy",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
             "request": "launch",
-            "program": "${workspaceFolder}/build_foundation_lcms.py",
+            "module": "foundationmsms.preprocessing",
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
             "args": [
                 "convert-raw",
-                "--raw-dir",
-                "data/raw",
-                "--mzml-dir",
-                "data/interim/mzml"
+                "--raw-dir", "data/raw/massive/MSV000083793",
+                "--mzml-dir", "data/mzml/massive/MSV000083793"
             ],
             "console": "integratedTerminal"
         },
         {
             "name": "Build Foundation: mzml-to-voxel",
             "type": "debugpy",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
             "request": "launch",
-            "program": "${workspaceFolder}/build_foundation_lcms.py",
+            "module": "foundationmsms.preprocessing",
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
             "args": [
                 "mzml-to-voxel",
-                "--mzml-dir",
-                "data/interim/mzml",
-                "--voxel-dir",
-                "data/processed/voxel",
-                "--mz-bin",
-                "1.0",
-                "--mz-parent-bin",
-                "1.0",
-                "--rt-bin-sec",
-                "1.0"
+                "--mzml-dir", "data/ccms_peak/massive/MSV000083793",
+                "--voxel-dir", "data/voxel/massive/downloaded/MSV000083793",
+                "--mz-bin", "1.0",
+                "--mz-parent-bin", "10",
+                "--rt-bin-sec", "10"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Build Foundation: mzml-to-voxel-provenance",
+            "type": "debugpy",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
+            "request": "launch",
+            "module": "foundationmsms.preprocessing.voxelize_with_provenance",
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "args": [
+                "--msv", "MSV000083793",
+                "--provenance", "converted"
             ],
             "console": "integratedTerminal"
         },
         {
             "name": "Build Foundation: window",
             "type": "debugpy",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
             "request": "launch",
-            "program": "${workspaceFolder}/build_foundation_lcms.py",
+            "module": "foundationmsms.preprocessing",
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
             "args": [
                 "window",
-                "--voxel-dir",
-                "data/processed/voxel",
-                "--window-sec",
-                "30",
-                "--stride-sec",
-                "15"
+                "--voxel-dir", "data/voxel/pride/PXD012353",
+                "--window-sec", "30",
+                "--stride-sec", "15"
             ],
             "console": "integratedTerminal"
+        },
+        {
+            "name": "Build Foundation: batch-download (priority 1)",
+            "type": "debugpy",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
+            "request": "launch",
+            "module": "foundationmsms.preprocessing",
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "args": [
+                "batch-download",
+                "--max-priority", "1",
+                "--parallel", "2",
+                "--skip-existing"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Build Foundation: batch-download (all, sequential)",
+            "type": "debugpy",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
+            "request": "launch",
+            "module": "foundationmsms.preprocessing",
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "args": [
+                "batch-download",
+                "--skip-existing"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Build Foundation: pipeline (with cleanup)",
+            "type": "debugpy",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
+            "request": "launch",
+            "module": "foundationmsms.preprocessing",
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "args": [
+                "pipeline",
+                "--dataset-dir", "data/raw/pride/PXD012353",
+                "--output-base", "data",
+                "--cleanup-raw",
+                "--cleanup-mzml",
+                "--mz-bin", "1.0",
+                "--mz-parent-bin", "1.0",
+                "--rt-bin-sec", "1.0",
+                "--window-sec", "30",
+                "--stride-sec", "15",
+                "--workers", "10"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Build Foundation: pipeline (no cleanup)",
+            "type": "debugpy",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
+            "request": "launch",
+            "module": "foundationmsms.preprocessing",
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "args": [
+                "pipeline",
+                "--dataset-dir", "data/raw/pride/PXD012353",
+                "--output-base", "data",
+                "--mz-bin", "1.0",
+                "--mz-parent-bin", "1.0",
+                "--rt-bin-sec", "1.0",
+                "--window-sec", "30",
+                "--stride-sec", "15",
+                "--workers", "4"
+            ],
+            "console": "integratedTerminal"
+        },
+        {
+            "name": "Train MSW Transformer",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
+            "module": "foundationmsms.training.train_msw_transformer",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "justMyCode": false,
+            "args": [
+                "--scenario", "${workspaceFolder}/data/doc_scenarios/docs_frag_only.npz",
+                "--voxel-dir", "${workspaceFolder}/data/voxel/pride/PXD012353",
+                "--npz-limit", "-1",
+                "--batch-size", "8",
+                "--epochs", "1000",
+                "--lr", "1e-3",
+                "--dim", "128",
+                "--heads", "4",
+                "--windows", "5,10,20"
+            ]
+        },
+        {
+            "name": "Train MSW Transformer (clf)",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
+            "module": "foundationmsms.training.train_msw_transformer",
+            "console": "integratedTerminal",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "${workspaceFolder}/src"
+            },
+            "justMyCode": false,
+            "args": [
+                "--task", "joint",
+                "--scenario", "${workspaceFolder}/data/doc_scenarios/custom_scenario.npz",
+                "--npz-limit", "-1",
+                "--batch-size", "8",
+                "--epochs", "1000",
+                "--lr", "1e-4",
+                "--dim", "32",
+                "--heads", "1",
+                "--windows", "10",
+                "--warmup-out", "warmup.pth",
+                "--resume-checkpoint", "${workspaceFolder}/checkpoints/last.pth",
+                "--transductive-inference",
+                "--max-seq-len", "0",
+                "--warmup-epochs", "0",
+                "--n-steps-per-epoch", "0",
+                "--n-steps-per-warmup-epoch", "1000"
+            ]
+        },
+        {
+            "name": "Build Scenario from Voxel",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
+            "module": "foundationmsms.preprocessing.build_scenario_from_voxel",
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "args": [
+                "--voxel-root", "data/voxel",
+                "--include", "MSV000083793,PXD010595,PXD012353,PXD021874",
+                "--out", "data/doc_scenarios/custom_scenario.npz",
+                "--msv-location", "downloaded"
+            ]
+        },
+        {
+            "name": "Add Labels to Scenario",
+            "type": "debugpy",
+            "request": "launch",
+            "python": "/home/simonp/anaconda3/envs/foundationmsms/bin/python",
+            "module": "foundationmsms.preprocessing.add_labels_to_scenario",
+            "cwd": "${workspaceFolder}",
+            "env": { "PYTHONPATH": "${workspaceFolder}/src" },
+            "console": "integratedTerminal",
+            "args": [
+                "--scenario", "data/doc_scenarios/custom_scenario.npz",
+                "--voxel-root", "data/voxel",
+                "--config", "configs/label_parsing.yaml",
+                // "--include", "MSV000083793,PXD010595,PXD012353,PXD021874",
+                "--include", "PXD012353"
+            ]
         }
-    ]
-    ,"inputs": [
+    ],
+    "inputs": [
         {
             "id": "msvAccession",
             "type": "promptString",
