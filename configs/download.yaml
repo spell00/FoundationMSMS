@@ -1,0 +1,22 @@
+pride_datasets:
+  - id: PXD050291
+    name: "Large-scale urinary proteomics DIA benchmark"
+    priority: 1
+
+  - id: PXD047676
+    name: "DIA Exploris 480 Evosep dataset"
+    priority: 1
+
+  - id: PXD016662
+    name: "Short-gradient DIA benchmark dataset"
+    priority: 1
+
+massive_datasets:
+  # Keep MassIVE accessions uppercase (MSV...) for downloader validation.
+  - id: MSV000083793
+    name: "MassIVE msv000083793 benchmark dataset"
+    priority: 1
+
+# Convention:
+# - priority > 0: included in run_experiment download + scenario build
+# - priority = 0: excluded (listed for record, but skipped)

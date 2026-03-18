@@ -2,7 +2,7 @@
 # run_experiment.sh – end-to-end experiment pipeline
 #
 # Stages:
-#   1. Download datasets listed in configs/datasets.yaml
+#   1. Download datasets listed in configs/download.yaml
 #   2. Preprocess (raw → mzML → voxel) for each dataset
 #   3. Build scenario .npz from voxels
 #   4. Train MSWTransformer
@@ -21,7 +21,8 @@ set -euo pipefail
 # ------------------------------------------------------------------
 # Config paths  (override via env vars)
 # ------------------------------------------------------------------
-CONFIG="${CONFIG:-configs/datasets.yaml}"
+DATASETS_CONFIG="${DATASETS_CONFIG:-configs/datasets.yaml}"
+DOWNLOAD_CONFIG="${DOWNLOAD_CONFIG:-configs/download.yaml}"
 LABEL_CONFIG="${LABEL_CONFIG:-configs/label_parsing.yaml}"
 
 # ------------------------------------------------------------------
@@ -76,21 +77,53 @@ export PYTHONPATH="${PYTHONPATH:-src}"
 echo "=========================================="
 echo " FoundationMSMS – Full Experiment Run"
 echo "=========================================="
-echo "  Config:     $CONFIG"
+echo "  Download:   $DOWNLOAD_CONFIG"
+echo "  Datasets:   $DATASETS_CONFIG"
 echo "  Scenario:   $SCENARIO_OUT"
 echo "  Task:       $TASK  |  Epochs: $EPOCHS  |  Device: $DEVICE"
 echo ""
+
+# Build the active dataset list from download config.
+# priority > 0 means active; priority = 0 means excluded.
+ACTIVE_DATASET_IDS_CSV=$($PYTHON -c "
+import sys, yaml
+try:
+    cfg = yaml.safe_load(open('$DOWNLOAD_CONFIG')) or {}
+    ids = [
+        str(d.get('id'))
+        for key in ('pride_datasets', 'massive_datasets')
+        for d in cfg.get(key, [])
+        if d.get('id') and int(d.get('priority', 1)) > 0
+    ]
+    print(','.join(ids))
+except Exception:
+    print('', end='')
+    sys.exit(1)
+")
+
+if [[ -z "$ACTIVE_DATASET_IDS_CSV" ]]; then
+    echo "ERROR: No active datasets (priority > 0) found in $DOWNLOAD_CONFIG" >&2
+    exit 1
+fi
+
+IFS=',' read -r -a ACTIVE_DATASET_IDS <<< "$ACTIVE_DATASET_IDS_CSV"
 
 # ------------------------------------------------------------------
 # Stage 1 – Download
 # ------------------------------------------------------------------
 if [[ "$SKIP_DOWNLOAD" = "0" ]]; then
     echo "--- Stage 1: Download ---"
-    $PYTHON -u -m foundationmsms.preprocessing batch-download \
-        --config "$CONFIG" \
-        --base-dir "$BASE_DIR" \
-        --parallel "$PARALLEL" \
+    dl_args=(
+        -u -m foundationmsms.preprocessing batch-download
+        --config "$DOWNLOAD_CONFIG"
+        --base-dir "$BASE_DIR"
+        --parallel "$PARALLEL"
         --skip-existing
+    )
+    for dsid in "${ACTIVE_DATASET_IDS[@]}"; do
+        dl_args+=(--id "$dsid")
+    done
+    $PYTHON "${dl_args[@]}"
     echo ""
 else
     echo "--- Stage 1: Download (skipped) ---"
@@ -125,27 +158,10 @@ fi
 # ------------------------------------------------------------------
 echo "--- Stage 3: Build scenario ---"
 
-# Extract comma-separated dataset IDs from configs/datasets.yaml via Python
-DATASET_IDS=$($PYTHON -c "
-import yaml, sys
-try:
-    cfg = yaml.safe_load(open('$CONFIG'))
-    ids = [str(d['id']) for d in cfg.get('datasets', [])]
-    print(','.join(ids))
-except Exception as e:
-    print('', end='')
-    sys.exit(1)
-")
-
-if [[ -z "$DATASET_IDS" ]]; then
-    echo "ERROR: Could not extract dataset IDs from $CONFIG" >&2
-    exit 1
-fi
-
-echo "  Datasets: $DATASET_IDS"
+echo "  Datasets: $ACTIVE_DATASET_IDS_CSV"
 $PYTHON -u -m foundationmsms.preprocessing.build_scenario_from_voxel \
     --voxel-root "${BASE_DIR}/voxel" \
-    --include "$DATASET_IDS" \
+    --include "$ACTIVE_DATASET_IDS_CSV" \
     --out "$SCENARIO_OUT" \
     --workers "$WORKERS"
 echo ""
