@@ -1,5 +1,16 @@
 # Data Directory Structure
 
+## Dataflow Schematic
+
+```mermaid
+flowchart LR
+    A[data/raw] --> B[data/mzml]
+    B --> C[data/voxel]
+    C --> D[data/windows]
+    C --> E[data/doc_scenarios/*.npz]
+    E --> F[training]
+```
+
 ## Organization
 
 ```
@@ -106,4 +117,18 @@ massive_windows = list(Path("data/windows/massive").rglob("*.npz"))
 
 # Filter by dataset
 pxd012353_windows = list(Path("data/windows/pride/PXD012353").glob("*.npz"))
+```
+
+## Dimension Metrics You Should Track
+
+- Voxel files per dataset
+- Corrupt voxel files per dataset
+- Parent bins per voxel file (p50/p90/p99)
+- Nonzero voxels per file (distribution)
+- Tokens per scenario document (p50/p90/p99)
+
+Generate these with:
+
+```bash
+python scripts/generate_data_eda.py --scenario data/doc_scenarios/experiment_auto.npz --voxel-root data/voxel --out-dir experiments/paper/eda
 ```

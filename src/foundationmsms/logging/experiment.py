@@ -21,19 +21,21 @@ def init_experiment(config: ExperimentConfig):
     writers: Dict[str, Any] = {}
 
     if config.use_tensorboard:
+        resolved_run_name = config.run_name or datetime.now().strftime("run_%Y%m%d_%H%M%S")
         try:
             from torch.utils.tensorboard import SummaryWriter
-        except Exception:
-            SummaryWriter = None
-        if SummaryWriter is not None:
-            if config.auto_run_subdir:
-                run_name = config.run_name or datetime.now().strftime("run_%Y%m%d_%H%M%S")
-                tb_log_dir = Path(config.log_dir) / run_name
-            else:
-                tb_log_dir = Path(config.log_dir)
-            tb_log_dir.mkdir(parents=True, exist_ok=True)
-            writers["tensorboard"] = SummaryWriter(log_dir=str(tb_log_dir))
-            writers["tensorboard_log_dir"] = str(tb_log_dir)
+        except Exception as exc:
+            raise RuntimeError(
+                "TensorBoard logging is enabled but unavailable. Install 'tensorboard' in the active environment."
+            ) from exc
+        if config.auto_run_subdir:
+            tb_log_dir = Path(config.log_dir) / resolved_run_name
+        else:
+            tb_log_dir = Path(config.log_dir)
+        tb_log_dir.mkdir(parents=True, exist_ok=True)
+        writers["tensorboard"] = SummaryWriter(log_dir=str(tb_log_dir))
+        writers["tensorboard_log_dir"] = str(tb_log_dir)
+        writers["run_name"] = resolved_run_name
 
     if config.use_comet:
         writers["comet"] = None
@@ -64,6 +66,8 @@ def log_metric(writers: Dict[str, Any], name: str, value: float, step: int = Non
             pluto_exp = writers.get("pluto")
             if pluto_exp is not None:
                 pluto_exp.log_metric(sub_tag, v, step=step)
+        if tb is not None:
+            tb.flush()
     elif tb is not None:
         tb.add_scalar(tag, value, step)
         # Comet
@@ -74,6 +78,7 @@ def log_metric(writers: Dict[str, Any], name: str, value: float, step: int = Non
         pluto_exp = writers.get("pluto")
         if pluto_exp is not None:
             pluto_exp.log_metric(tag, value, step=step)
+        tb.flush()
 
 
 def log_hparams(writers: Dict[str, Any], hparam_dict: dict, metric_dict: dict) -> None:
@@ -87,6 +92,7 @@ def log_hparams(writers: Dict[str, Any], hparam_dict: dict, metric_dict: dict) -
         # TensorBoard requires metric values to be plain Python floats
         safe_metrics = {k: float(v) for k, v in metric_dict.items()}
         tb.add_hparams(hparam_dict, safe_metrics)
+        tb.flush()
     comet_exp = writers.get("comet")
     if comet_exp is not None:
         for k, v in hparam_dict.items():

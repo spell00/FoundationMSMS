@@ -1,8 +1,14 @@
 numpy>=2.1.0
+torch
+tensorboard
 pymzml
 pridepy
 tqdm>=4.66.0
 pytest
 pyyaml
 matplotlib
+seaborn
 pridepy
+scikit-learn
+xgboost
+optuna

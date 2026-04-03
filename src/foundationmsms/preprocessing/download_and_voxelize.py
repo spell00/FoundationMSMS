@@ -1,5 +1,7 @@
 import argparse
+import ftplib
 import os
+import posixpath
 import re
 import subprocess
 import time
@@ -11,6 +13,9 @@ from typing import Iterable, Optional, Tuple
 import numpy as np
 import sys
 from tqdm import tqdm
+
+
+_DOCKER_STATUS_CACHE: Optional[Tuple[bool, str]] = None
 
 # -----------------------------
 # Helpers: safe shell execution
@@ -29,12 +34,17 @@ def _dir_stats(path: Path) -> tuple[int, int]:
                 pass
     return file_count, total_bytes
 
-def convert_one(f, voxel_dir, mz_bin, mz_parent_bin, rt_bin_sec):
+def convert_one(f, voxel_dir, mz_bin, mz_parent_bin, rt_bin_sec, force: bool = False):
     import os
-    out = voxel_dir / (f.stem + ".npz")
+    param_folder = f"mzbin_{mz_bin}_mzparent_{mz_parent_bin}_rtbin_{rt_bin_sec}"
+    out_dir = voxel_dir / param_folder
+    out_dir.mkdir(parents=True, exist_ok=True)
+    out = out_dir / (f.stem + ".npz")
     worker_id = os.getpid()
-    if out.exists():
+    if out.exists() and not force:
         return f"⏭️  Skipped {f.name} - voxel already exists"
+    if out.exists() and force:
+        out.unlink()
     print(f"[Worker {worker_id}] Voxelizing {f} -> {out}")
     try:
         mzml_to_voxel_npz(
@@ -85,6 +95,9 @@ def run(
     start_time = time.time()
     last_output_time = start_time
     next_tick = start_time + progress_interval_sec
+    last_files = -1
+    last_bytes = -1
+    current_file: str = ""
 
     while True:
         if process.poll() is not None:
@@ -95,18 +108,35 @@ def run(
             line = key.fileobj.readline()
             if line:
                 last_output_time = time.time()
-                print(line, end="", flush=True)
+                stripped = line.strip()
+                # lftp --verbose emits lines like:
+                #   `Transferring file `/remote/path/foo.mzML'`
+                #   or just the bare filename on some versions
+                if stripped.startswith("Transferring file"):
+                    # extract filename between backtick and single-quote
+                    import re as _re
+                    m = _re.search(r"`(.+?)'", stripped)
+                    if m:
+                        current_file = m.group(1).split("/")[-1]
+                        print(f"[{progress_label}] → {current_file}", flush=True)
+                elif stripped.startswith("mirror:") or stripped.startswith("lftp:"):
+                    print(line, end="", flush=True)
+                # suppress other lftp chatter (chmod, mkdir, skipping, etc.)
 
         now = time.time()
         if progress_dir is not None and progress_interval_sec > 0 and now >= next_tick:
             files, total_bytes = _dir_stats(progress_dir)
             mb = total_bytes / (1024 * 1024)
             elapsed = int(now - start_time)
-            quiet = int(now - last_output_time)
-            print(
-                f"[{progress_label}] files={files} size={mb:.2f}MB elapsed={elapsed}s no_output_for={quiet}s",
-                flush=True,
-            )
+            # Only print if something actually changed
+            if files != last_files or total_bytes != last_bytes:
+                extra = f" ({current_file})" if current_file else ""
+                print(
+                    f"[{progress_label}] files={files} size={mb:.2f}MB elapsed={elapsed}s{extra}",
+                    flush=True,
+                )
+                last_files = files
+                last_bytes = total_bytes
             next_tick = now + progress_interval_sec
 
     for line in process.stdout:
@@ -131,6 +161,178 @@ def which(name: str) -> Optional[str]:
     from shutil import which as _which
     return _which(name)
 
+
+def _format_bytes(n: int) -> str:
+    units = ["B", "KB", "MB", "GB", "TB"]
+    x = float(max(n, 0))
+    for u in units:
+        if x < 1024.0 or u == units[-1]:
+            return f"{x:.2f}{u}"
+        x /= 1024.0
+    return f"{x:.2f}TB"
+
+
+def _remote_ftp_stats(
+    host: str,
+    root_path: str,
+    user: str = "anonymous",
+    password: str = "anonymous",
+    include_exts: Optional[Tuple[str, ...]] = None,
+    progress_label: str = "remote-scan",
+    progress_interval_sec: int = 5,
+) -> Optional[Tuple[int, int]]:
+    """Recursively scan remote FTP tree and return (files, bytes).
+
+    Prints periodic progress updates while scanning. Returns None if scan fails.
+    """
+    def _fallback_lftp_scan() -> Optional[Tuple[int, int]]:
+        if which("lftp") is None:
+            return None
+
+        # 1) Count files via recursive `find` output.
+        files = 0
+        start = time.time()
+        next_tick = start + max(1, int(progress_interval_sec))
+        print(f"[{progress_label}] scanning ftp://{host}{root_path} via lftp find ...", flush=True)
+        try:
+            p = subprocess.Popen(
+                [
+                    "lftp",
+                    "-e",
+                    (
+                        "set net:max-retries 1; "
+                        "set net:timeout 20; "
+                        "set ftp:ssl-allow no; "
+                        f"open -u {user},{password} {host}; "
+                        f"find {root_path}; "
+                        "bye"
+                    ),
+                ],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            assert p.stdout is not None
+            for line in p.stdout:
+                s = line.strip()
+                if not s or s.startswith("lftp"):
+                    continue
+                low = s.lower()
+                if include_exts:
+                    if any(low.endswith(ext) for ext in include_exts):
+                        files += 1
+                else:
+                    # Directory entries typically end with '/'.
+                    if not s.endswith("/"):
+                        files += 1
+
+                now = time.time()
+                if now >= next_tick:
+                    elapsed = int(now - start)
+                    print(f"[{progress_label}] files={files} elapsed={elapsed}s", flush=True)
+                    next_tick = now + max(1, int(progress_interval_sec))
+            p.wait(timeout=10)
+        except Exception:
+            return None
+
+        # 2) Estimate bytes via remote du (best effort).
+        total_bytes = 0
+        try:
+            du = subprocess.run(
+                [
+                    "lftp",
+                    "-e",
+                    (
+                        "set net:max-retries 1; "
+                        "set net:timeout 20; "
+                        "set ftp:ssl-allow no; "
+                        f"open -u {user},{password} {host}; "
+                        f"du -sb {root_path}; "
+                        "bye"
+                    ),
+                ],
+                capture_output=True,
+                text=True,
+                timeout=30,
+            )
+            m = re.search(r"(\d+)", du.stdout or "")
+            if m:
+                total_bytes = int(m.group(1))
+        except Exception:
+            total_bytes = 0
+
+        elapsed = int(time.time() - start)
+        print(
+            f"[{progress_label}] done files={files} size={_format_bytes(total_bytes)} elapsed={elapsed}s",
+            flush=True,
+        )
+        return files, total_bytes
+
+    ftp = ftplib.FTP()
+    try:
+        ftp.connect(host=host, timeout=20)
+        ftp.login(user=user, passwd=password)
+
+        files = 0
+        total_bytes = 0
+        visited_dirs = 0
+        stack = [root_path.rstrip("/") or "/"]
+
+        start = time.time()
+        next_tick = start + max(1, int(progress_interval_sec))
+        print(f"[{progress_label}] scanning ftp://{host}{root_path} ...", flush=True)
+
+        while stack:
+            cur = stack.pop()
+            visited_dirs += 1
+            try:
+                entries = list(ftp.mlsd(cur, facts=["type", "size"]))
+            except Exception:
+                # Some FTP backends may reject selected paths/facts; skip those.
+                continue
+
+            for name, facts in entries:
+                if name in (".", ".."):
+                    continue
+                typ = (facts or {}).get("type", "")
+                full = posixpath.join(cur, name) if cur != "/" else f"/{name}"
+                if typ == "dir":
+                    stack.append(full)
+                    continue
+                if typ == "file":
+                    low = name.lower()
+                    if include_exts and not any(low.endswith(ext) for ext in include_exts):
+                        continue
+                    files += 1
+                    try:
+                        total_bytes += int((facts or {}).get("size", "0") or 0)
+                    except Exception:
+                        pass
+
+            now = time.time()
+            if now >= next_tick:
+                elapsed = int(now - start)
+                print(
+                    f"[{progress_label}] dirs={visited_dirs} files={files} size={_format_bytes(total_bytes)} elapsed={elapsed}s",
+                    flush=True,
+                )
+                next_tick = now + max(1, int(progress_interval_sec))
+
+        elapsed = int(time.time() - start)
+        print(
+            f"[{progress_label}] done files={files} size={_format_bytes(total_bytes)} elapsed={elapsed}s",
+            flush=True,
+        )
+        return files, total_bytes
+    except Exception:
+        return _fallback_lftp_scan()
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+
 # -----------------------------
 # Downloaders
 # -----------------------------
@@ -140,12 +342,44 @@ def pride_download_raw(
     protocol: str = "ftp",
     retries: int = 3,
     retry_delay_sec: int = 10,
+    ftp_url: str = None,
 ) -> None:
     """
-    Uses pridepy to download all public RAW files for a PRIDE project.
-    pridepy supports ftp/aspera/globus/s3 depending on your environment. :contentReference[oaicite:4]{index=4}
+    Download all public files for a PRIDE project.
+    If ftp_url is provided the directory is mirrored directly via lftp,
+    bypassing pridepy entirely (faster, no API round-trips).
     """
     out_dir.mkdir(parents=True, exist_ok=True)
+
+    if ftp_url:
+        if which("lftp") is None:
+            raise RuntimeError("lftp not found. Install with: sudo apt-get install -y lftp")
+        from urllib.parse import urlparse
+        parsed = urlparse(ftp_url)
+        host = parsed.hostname
+        path = parsed.path.rstrip("/") or f"/pride/data/archive/{project}"
+        print(f"[pride:{project}] Using known URL: ftp://{host}{path}")
+        stats = _remote_ftp_stats(host, path, progress_label=f"pride:{project}:scan")
+        if stats is not None:
+            est_files, est_bytes = stats
+            print(
+                f"[pride:{project}] estimated transfer: {est_files} files, {_format_bytes(est_bytes)}",
+                flush=True,
+            )
+        cmd = [
+            "lftp", "-e",
+            (
+                "set net:max-retries 3; "
+                "set net:timeout 30; "
+                "set ftp:ssl-allow no; "
+                f"open -u anonymous,anonymous {host}; "
+                f"mirror --continue --verbose --parallel=4 {path} {out_dir}; "
+                "bye"
+            ),
+        ]
+        run(cmd, progress_dir=out_dir, progress_label=f"pride:{project}", progress_interval_sec=5)
+        return
+
     pridepy_cli = which("pridepy")
     if pridepy_cli is None:
         try:
@@ -197,9 +431,12 @@ def pride_download_raw(
         _run_with(protocol)
 
 
-def massive_download_dataset(msv: str, out_dir: Path, voxel_dir: Path = None, mz_bin: float = 1.0, mz_parent_bin: float = 1.0, rt_bin_sec: float = 1.0, async_voxel: bool = False, type_: str = None) -> None:
+def massive_download_dataset(msv: str, out_dir: Path, voxel_dir: Path = None, mz_bin: float = 1.0, mz_parent_bin: float = 1.0, rt_bin_sec: float = 1.0, async_voxel: bool = False, type_: str = None, ftp_url: str = None, mzml_only: bool = False) -> None:
     """
-    MassIVE exposes public datasets via anonymous FTP. Correct path is /{msv}/ccms_data/{version} or /{msv}/ccms_peak/peak/mzml, etc.
+    MassIVE exposes public datasets via anonymous FTP.
+    If ftp_url is provided (e.g. 'ftp://massive-ftp.ucsd.edu/v02/MSV000083793/'),
+    it is used directly without any path probing.
+    If mzml_only is True, only *.mzML files are mirrored (skips RAW and other files).
     """
     if not re.match(r"^MSV\d{9}$", msv) or msv == "MSV000000000":
         raise RuntimeError(
@@ -210,6 +447,67 @@ def massive_download_dataset(msv: str, out_dir: Path, voxel_dir: Path = None, mz
     if which("lftp") is None:
         raise RuntimeError("lftp not found. Install with: sudo apt-get install -y lftp")
 
+    # Fast path: if the caller already knows the FTP URL, use it directly.
+    if ftp_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(ftp_url)
+        known_host = parsed.hostname
+        known_path = parsed.path.rstrip("/") or f"/{msv}"
+        parallel_files = int(os.environ.get("LFTP_PARALLEL", "1"))
+        pget_n = int(os.environ.get("LFTP_PGET", "1"))
+        if hasattr(massive_download_dataset, "_cli_parallel"):
+            parallel_files = massive_download_dataset._cli_parallel
+        if hasattr(massive_download_dataset, "_cli_pget"):
+            pget_n = massive_download_dataset._cli_pget
+        mirror_opts = f"--continue --verbose --parallel={parallel_files}"
+        if pget_n > 1:
+            mirror_opts += f" --use-pget-n={pget_n}"
+        if mzml_only:
+            mirror_opts += " --include-glob '*.mzML' --include-glob '*.mzml'"
+            print(f"[massive] Using known URL (mzML only): ftp://{known_host}{known_path}")
+        else:
+            print(f"[massive] Using known URL: ftp://{known_host}{known_path}")
+        stats = _remote_ftp_stats(
+            known_host,
+            known_path,
+            include_exts=(".mzml",) if mzml_only else None,
+            progress_label=f"massive:{msv}:scan",
+        )
+        if stats is not None:
+            est_files, est_bytes = stats
+            print(
+                f"[massive:{msv}] estimated transfer: {est_files} files, {_format_bytes(est_bytes)}",
+                flush=True,
+            )
+        cmd = [
+            "lftp", "-e",
+            (
+                "set net:max-retries 3; "
+                "set net:timeout 30; "
+                "set ftp:ssl-allow no; "
+                f"open -u anonymous,anonymous {known_host}; "
+                f"mirror {mirror_opts} {known_path} {out_dir}; "
+                "bye"
+            ),
+        ]
+        run(cmd, progress_dir=out_dir, progress_label=f"massive:{msv}", progress_interval_sec=5)
+        if async_voxel and voxel_dir is not None:
+            from threading import Thread
+            def _async_voxel_known():
+                import time
+                from tqdm import tqdm
+                time.sleep(2)
+                for f in tqdm(list(Path(out_dir).rglob("*.mzML")), desc="mzML->voxel (async)"):
+                    npz_out = Path(voxel_dir) / (f.stem + ".npz")
+                    try:
+                        mzml_to_voxel_npz(f, npz_out, mz_bin=mz_bin, mz_parent_bin=mz_parent_bin,
+                                          rt_bin_sec=rt_bin_sec, rt_range_sec=None,
+                                          ms2_only=True, intensity_transform="log1p")
+                        f.unlink()
+                    except Exception as e:
+                        print(f"[async-voxel] Failed {f}: {e}")
+            Thread(target=_async_voxel_known, daemon=True).start()
+        return
 
     versions = ["v12","v11","v10","v09","v08","v07","v06","v05","v04","v03","v02","v01","x01","z01"]
     remote_dirs = []
@@ -218,6 +516,7 @@ def massive_download_dataset(msv: str, out_dir: Path, voxel_dir: Path = None, mz
         # Only look in ccms_data root, not subfolders
         product = "raw"
         for v in versions:
+            remote_dirs.append(f"/{v}/{msv}")
             remote_dirs.append(f"/{v}/{msv}/{product}")
         for v in versions:
             remote_dirs.append(f"/{msv}/{product}/{v}")
@@ -228,6 +527,8 @@ def massive_download_dataset(msv: str, out_dir: Path, voxel_dir: Path = None, mz
         # Default: ccms_peak or other types, keep all subfolder logic
         product = "ccms_peak" if (type_ is not None and type_.lower() == "ccms_peak") else "ccms_data"
         for v in versions:
+            # Try bare versioned root first (e.g. ftp://massive-ftp.ucsd.edu/v02/MSV000083793/)
+            remote_dirs.append(f"/{v}/{msv}")
             remote_dirs.append(f"/{v}/{msv}/{product}")
             remote_dirs.append(f"/{v}/{msv}/{product}/peak")
             remote_dirs.append(f"/{v}/{msv}/{product}/peak/mzml")
@@ -252,110 +553,127 @@ def massive_download_dataset(msv: str, out_dir: Path, voxel_dir: Path = None, mz
     mirror_opts = f"--continue --verbose --parallel={parallel_files}"
     if pget_n > 1:
         mirror_opts += f" --use-pget-n={pget_n}"
+    if mzml_only:
+        mirror_opts += " --include-glob '*.mzML' --include-glob '*.mzml'"
 
-    hosts = ["ccms-ftp.ucsd.edu", "massive-ftp.ucsd.edu"]
+    hosts = ["massive-ftp.ucsd.edu", "ccms-ftp.ucsd.edu"]
     user = "anonymous"
     password = "anonymous"
-    last_exc: Optional[Exception] = None
+
+    def _probe_path(host: str, path: str, u: str, pw: str) -> bool:
+        """Return True if lftp cls lists any content at host/path within 5s."""
+        try:
+            r = subprocess.run(
+                [
+                    "lftp", "-e",
+                    f"set net:max-retries 0; set net:timeout 5; set ftp:ssl-allow no; "
+                    f"open -u {u},{pw} {host}; cls -1 {path}; bye",
+                ],
+                capture_output=True, text=True, timeout=12,
+            )
+            return r.returncode == 0 and bool(r.stdout.strip())
+        except Exception:
+            return False
+
+    def _do_mirror(host: str, remote_dir: str, u: str, pw: str) -> None:
+        print(f"[massive] Mirroring ftp://{host}{remote_dir} -> {out_dir}")
+        stats = _remote_ftp_stats(
+            host,
+            remote_dir,
+            user=u,
+            password=pw,
+            include_exts=(".mzml",) if mzml_only else None,
+            progress_label=f"massive:{msv}:scan",
+        )
+        if stats is not None:
+            est_files, est_bytes = stats
+            print(
+                f"[massive:{msv}] estimated transfer: {est_files} files, {_format_bytes(est_bytes)}",
+                flush=True,
+            )
+        cmd = [
+            "lftp", "-e",
+            (
+                "set net:max-retries 3; "
+                "set net:timeout 30; "
+                "set ftp:ssl-allow no; "
+                f"set net:connection-limit {parallel_files * max(1, pget_n)}; "
+                f"open -u {u},{pw} {host}; "
+                f"mirror {mirror_opts} {remote_dir} {out_dir}; "
+                "bye"
+            ),
+        ]
+        run(cmd, progress_dir=out_dir, progress_label=f"massive:{msv}", progress_interval_sec=5)
+
+    def _maybe_async_voxel():
+        if async_voxel and voxel_dir is not None:
+            from threading import Thread
+            def convert_and_cleanup():
+                import time
+                from tqdm import tqdm
+                time.sleep(2)
+                files = list(Path(out_dir).rglob("*.mzML"))
+                for f in tqdm(files, desc="mzML->voxel (async)"):
+                    npz_out = Path(voxel_dir) / (f.stem + ".npz")
+                    try:
+                        mzml_to_voxel_npz(
+                            f, npz_out,
+                            mz_bin=mz_bin, mz_parent_bin=mz_parent_bin,
+                            rt_bin_sec=rt_bin_sec, rt_range_sec=None,
+                            ms2_only=True, intensity_transform="log1p",
+                        )
+                        f.unlink()
+                    except Exception as e:
+                        print(f"[async-voxel] Failed {f}: {e}")
+            Thread(target=convert_and_cleanup, daemon=True).start()
+
+    # Phase 1: fast ls-probe to locate the right host + path (no mirror yet)
+    found_host: Optional[str] = None
+    found_path: Optional[str] = None
     for host in hosts:
         for remote_dir in remote_dirs:
-            print(f"[massive] Trying FTP: ftp://{host}{remote_dir} (user={user})")
-            cmd = [
-                "lftp",
-                "-e",
-                (
-                    "set net:max-retries 2; "
-                    "set net:timeout 20; "
-                    "set ftp:ssl-allow no; "
-                    # optional but often helps stability under parallelism
-                    f"set net:connection-limit {parallel_files * max(1, pget_n)}; "
-                    f"open -u {user},{password} {host}; "
-                    f"mirror {mirror_opts} {remote_dir} {out_dir}; "
-                    "bye"
-                ),
-            ]
-            try:
-                run(cmd, progress_dir=out_dir, progress_label=f"massive:{msv}", progress_interval_sec=5)
-                # Async voxel conversion and cleanup
-                if async_voxel and voxel_dir is not None:
-                    from threading import Thread
-                    def convert_and_cleanup():
-                        import time
-                        from pathlib import Path
-                        from tqdm import tqdm
-                        # Wait for all mzML files to finish downloading
-                        time.sleep(2)
-                        files = list(Path(out_dir).rglob("*.mzML"))
-                        for f in tqdm(files, desc="mzML->voxel (async)"):
-                            out = Path(voxel_dir) / (f.stem + ".npz")
-                            try:
-                                mzml_to_voxel_npz(
-                                    f,
-                                    out,
-                                    mz_bin=mz_bin,
-                                    mz_parent_bin=mz_parent_bin,
-                                    rt_bin_sec=rt_bin_sec,
-                                    rt_range_sec=None,
-                                    ms2_only=True,
-                                    intensity_transform="log1p",
-                                )
-                                f.unlink()
-                            except Exception as e:
-                                print(f"[async-voxel] Failed {f}: {e}")
-                    Thread(target=convert_and_cleanup, daemon=True).start()
-                return
-            except RuntimeError as exc:
-                last_exc = exc
+            print(f"[massive] Probing ftp://{host}{remote_dir} ...")
+            if _probe_path(host, remote_dir, user, password):
+                found_host, found_path = host, remote_dir
+                break
+        if found_host:
+            break
 
-    # If all anonymous attempts fail, try private (user=msv, password from env)
+    # Phase 2: mirror the confirmed path (or fall back to private credentials)
+    if found_host and found_path:
+        try:
+            _do_mirror(found_host, found_path, user, password)
+            _maybe_async_voxel()
+            return
+        except RuntimeError as exc:
+            pass  # fall through to private-creds attempt
+
+    # Private credentials fallback
     env_user = os.environ.get("MASSIVE_FTP_USER")
     env_pass = os.environ.get("MASSIVE_FTP_PASS")
     if env_user and env_pass:
+        probe_host: Optional[str] = None
+        probe_path: Optional[str] = None
         for host in hosts:
             for remote_dir in remote_dirs:
-                print(f"[massive] Trying FTP (private): ftp://{host}{remote_dir} (user={env_user})")
-                cmd = [
-                    "lftp",
-                    "-e",
-                    f"set net:max-retries 2; set net:timeout 20; set ftp:ssl-allow no; "
-                    f"open -u {env_user},{env_pass} {host}; "
-                    f"mirror --continue --verbose {remote_dir} {out_dir}; "
-                    f"bye",
-                ]
-                try:
-                    run(cmd, progress_dir=out_dir, progress_label=f"massive:{msv}", progress_interval_sec=5)
-                    if async_voxel and voxel_dir is not None:
-                        from threading import Thread
-                        def convert_and_cleanup():
-                            import time
-                            from pathlib import Path
-                            from tqdm import tqdm
-                            time.sleep(2)
-                            files = list(Path(out_dir).rglob("*.mzML"))
-                            for f in tqdm(files, desc="mzML->voxel (async)"):
-                                out = Path(voxel_dir) / (f.stem + ".npz")
-                                try:
-                                    mzml_to_voxel_npz(
-                                        f,
-                                        out,
-                                        mz_bin=mz_bin,
-                                        mz_parent_bin=mz_parent_bin,
-                                        rt_bin_sec=rt_bin_sec,
-                                        rt_range_sec=None,
-                                        ms2_only=True,
-                                        intensity_transform="log1p",
-                                    )
-                                    f.unlink()
-                                except Exception as e:
-                                    print(f"[async-voxel] Failed {f}: {e}")
-                        Thread(target=convert_and_cleanup, daemon=True).start()
-                    return
-                except RuntimeError as exc:
-                    last_exc = exc
+                print(f"[massive] Probing (private) ftp://{host}{remote_dir} (user={env_user}) ...")
+                if _probe_path(host, remote_dir, env_user, env_pass):
+                    probe_host, probe_path = host, remote_dir
+                    break
+            if probe_host:
+                break
+        if probe_host and probe_path:
+            try:
+                _do_mirror(probe_host, probe_path, env_user, env_pass)
+                _maybe_async_voxel()
+                return
+            except RuntimeError:
+                pass
 
     raise RuntimeError(
         f"MassIVE download failed for {msv}. Verify the accession exists and "
-        f"that massive-ftp.ucsd.edu or ccms-ftp.ucsd.edu is reachable. Original error: {last_exc}"
+        f"that massive-ftp.ucsd.edu is reachable. "
+        f"Known-good URL pattern: ftp://massive-ftp.ucsd.edu/v02/{msv}/"
     )
 
 def detect_acquisition_mode(mzml_file: Path) -> str:
@@ -418,6 +736,30 @@ def msconvert_to_mzml(raw_path: Path, mzml_path: Path, centroid: bool = True) ->
     mzml_path.parent.mkdir(parents=True, exist_ok=True)
 
     if use_docker:
+        global _DOCKER_STATUS_CACHE
+        if _DOCKER_STATUS_CACHE is None:
+            probe = subprocess.run(
+                ["docker", "info"],
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+            if probe.returncode == 0:
+                _DOCKER_STATUS_CACHE = (True, "")
+            else:
+                detail = (probe.stderr or probe.stdout or "docker info failed").strip()
+                _DOCKER_STATUS_CACHE = (False, detail)
+
+        docker_ok, docker_detail = _DOCKER_STATUS_CACHE
+        if not docker_ok:
+            raise RuntimeError(
+                "Docker is installed but not usable for msconvert container runs. "
+                f"Details: {docker_detail}. "
+                "Fix options: (1) install local msconvert and set MSCONVERT_BIN, "
+                "(2) enable Docker daemon access for this user (e.g. add user to docker group and relogin), "
+                "or (3) run with sudo docker (not recommended in pipeline)."
+            )
+
         image = os.environ.get("MSCONVERT_IMAGE", "chambm/pwiz-skyline-i-agree-to-the-vendor-licenses")
         raw_dir = raw_path.parent.resolve()
         out_dir = mzml_path.parent.resolve()
@@ -652,9 +994,17 @@ def batch_download_datasets(
         for ds in config.get("massive_datasets", []):
             datasets.append(("massive", ds))
     
+    def _ds_canonical_id(src: str, ds: dict) -> str:
+        """Return the canonical identifier for a dataset entry.
+        Pride entries with a massive_id use that (data lands in massive dir).
+        """
+        if src == "pride":
+            return ds.get("massive_id") or ds.get("pride_id") or ds.get("id", "")
+        return ds.get("massive_id") or ds.get("id", "")
+
     # Filter by dataset IDs if specified
     if dataset_ids:
-        datasets = [(src, ds) for src, ds in datasets if ds["id"] in dataset_ids]
+        datasets = [(src, ds) for src, ds in datasets if _ds_canonical_id(src, ds) in dataset_ids]
     
     # Filter by priority
     if max_priority is not None:
@@ -666,47 +1016,83 @@ def batch_download_datasets(
     print(f"Found {len(datasets)} datasets to process with {parallel} parallel downloads")
     
     def download_one(source, ds):
-        dataset_id = ds["id"]
+        canonical_id = _ds_canonical_id(source, ds)
+        pride_id = ds.get("pride_id") or ds.get("id", canonical_id)
+        massive_id = ds.get("massive_id")
+        is_massive_mode = (source == "massive") or bool(massive_id)
+        effective_massive_id = massive_id or (canonical_id if source == "massive" else None)
+        mzml_only = bool(ds.get("mzml_only", True if massive_id else False))
         desc = ds.get("description", "")
         size = ds.get("size", "unknown")
         samples = ds.get("samples", "?")
         priority = ds.get("priority", "?")
-        
-        if source == "pride":
-            out_dir = base_dir / "raw" / "pride" / dataset_id
+
+        # Output dir: massive data under massive/, pride-only under pride/
+        if massive_id:
+            out_dir = base_dir / "raw" / "massive" / massive_id
+        elif source == "pride":
+            out_dir = base_dir / "raw" / "pride" / pride_id
         else:
-            out_dir = base_dir / "raw" / "massive" / dataset_id
-        
-        # Check if exists
+            out_dir = base_dir / "raw" / "massive" / canonical_id
+
+        # Check if raw-download output already exists
         exists = out_dir.exists() and any(out_dir.iterdir())
-        
-        if exists and skip_existing and not reload:
-            return f"⏭️  Skipped {dataset_id} - already exists"
-        
+
+        # For mzML-only MassIVE downloads, existing mzML files already satisfy this stage.
+        mzml_exists = False
+        if is_massive_mode and effective_massive_id is not None and mzml_only:
+            mzml_dir = base_dir / "mzml" / "massive" / effective_massive_id
+            if mzml_dir.exists():
+                mzml_exists = any(mzml_dir.rglob("*.mzML")) or any(mzml_dir.rglob("*.mzml"))
+
+        if (exists or mzml_exists) and skip_existing and not reload:
+            if mzml_exists and not exists:
+                return f"⏭️  Skipped {canonical_id} - mzML already exists in {base_dir / 'mzml' / 'massive' / effective_massive_id}"
+            return f"⏭️  Skipped {canonical_id} - already exists"
+
         if exists and reload:
             import shutil
             shutil.rmtree(out_dir)
-        
-        print(f"\n📥 Downloading {dataset_id} [Priority {priority}]")
+
+        print(f"\n📥 Downloading {canonical_id} [Priority {priority}]")
         print(f"   Description: {desc}")
         print(f"   Samples: {samples}")
         print(f"   Size: {size}")
         print(f"   Output: {out_dir}")
-        
+
         try:
             if source == "pride":
+                # If a MassIVE mirror is known, prefer it (mzML already pre-processed).
+                if massive_id:
+                    try:
+                        print(f"   Trying MassIVE mirror {massive_id} (mzml_only={mzml_only}) before PRIDE RAW")
+                        massive_download_dataset(
+                            massive_id, out_dir,
+                            ftp_url=ds.get("ftp_url"),
+                            mzml_only=mzml_only,
+                        )
+                        return f"✅ Completed {canonical_id} (via MassIVE {massive_id})"
+                    except Exception as msv_exc:
+                        print(f"   MassIVE attempt failed ({msv_exc}), falling back to PRIDE RAW")
+                        out_dir = base_dir / "raw" / "pride" / pride_id
+                        out_dir.mkdir(parents=True, exist_ok=True)
                 pride_download_raw(
-                    dataset_id,
+                    pride_id,
                     out_dir,
                     protocol=pride_protocol,
                     retries=retries,
                     retry_delay_sec=retry_delay_sec,
+                    ftp_url=ds.get("ftp_url") if not massive_id else None,
                 )
             else:
-                massive_download_dataset(dataset_id, out_dir)
-            return f"✅ Completed {dataset_id}"
+                massive_download_dataset(
+                    canonical_id, out_dir,
+                    ftp_url=ds.get("ftp_url"),
+                    mzml_only=mzml_only,
+                )
+            return f"✅ Completed {canonical_id}"
         except Exception as e:
-            return f"❌ Failed {dataset_id}: {e}"
+            return f"❌ Failed {canonical_id}: {e}"
     
     if parallel <= 1:
         # Sequential
@@ -716,7 +1102,7 @@ def batch_download_datasets(
     else:
         # Parallel
         with ThreadPoolExecutor(max_workers=parallel) as executor:
-            futures = {executor.submit(download_one, src, ds): ds["id"] for src, ds in datasets}
+            futures = {executor.submit(download_one, src, ds): _ds_canonical_id(src, ds) for src, ds in datasets}
             for future in as_completed(futures):
                 result = future.result()
                 print(f"\n{result}")
@@ -743,14 +1129,16 @@ def _convert_raw_file(args):
 
 def _convert_mzml_file(args):
     """Convert single mzML file to voxel (module-level for multiprocessing), with mode-based folder split"""
-    f, voxel_dir, cleanup_mzml, mz_bin, mz_parent_bin, rt_bin_sec = args
+    f, voxel_dir, cleanup_mzml, force_voxel, mz_bin, mz_parent_bin, rt_bin_sec = args
     mode = detect_acquisition_mode(f)
     mode_folder = mode if mode in ("DIA", "DDA") else "OTHERS"
     out_dir = voxel_dir / mode_folder
     out_dir.mkdir(parents=True, exist_ok=True)
     voxel_out = out_dir / (f.stem + ".npz")
-    if voxel_out.exists():
+    if voxel_out.exists() and not force_voxel:
         return f"⏭️  Skipped {f.name} - exists ({mode_folder})"
+    if voxel_out.exists() and force_voxel:
+        voxel_out.unlink()
     try:
         mzml_to_voxel_npz(
             f,
@@ -775,6 +1163,7 @@ def run_pipeline(
     cleanup_raw: bool = False,
     cleanup_mzml: bool = False,
     force_raw: bool = False,
+    force_voxel: bool = False,
     mz_bin: float = 1.0,
     mz_parent_bin: float = 10.,
     rt_bin_sec: float = 10.,
@@ -814,7 +1203,8 @@ def run_pipeline(
         dataset_id = dataset_dir.name
     
     mzml_dir = output_base / "mzml" / source / dataset_id
-    voxel_dir = output_base / "voxel" / source / dataset_id
+    param_folder = f"mzbin_{mz_bin}_mzparent_{mz_parent_bin}_rtbin_{rt_bin_sec}"
+    voxel_dir = output_base / "voxel" / source / dataset_id / param_folder
     window_dir = output_base / "windows" / source / dataset_id
     
     # Step 1: RAW -> mzML (or copy existing mzMLs for MassIVE peak/mzml)
@@ -853,31 +1243,48 @@ def run_pipeline(
     # Step 2: mzML -> voxel
     print(f"\n🔄 Step 2/3: Converting mzML to voxels (workers={workers})")
     voxel_dir.mkdir(parents=True, exist_ok=True)
-    mzmls = list(mzml_dir.rglob("*.mzML"))
+    # Write a single metadata file for this parameter set
+    import yaml
+    meta = {
+        "dataset_dir": str(dataset_dir),
+        "mz_bin": mz_bin,
+        "mz_parent_bin": mz_parent_bin,
+        "rt_bin_sec": rt_bin_sec,
+        "mz_range": [100.0, 2000.0],
+        "mz_parent_range": [300.0, 2000.0],
+        "rt_range_sec": None,
+        "ms2_only": True,
+        "intensity_transform": "log1p",
+        "voxel_files": [str(voxel_dir / (f.stem + ".npz")) for f in mzmls],
+    }
+    meta_path = voxel_dir / "voxelization_params.yaml"
+    with open(meta_path, "w") as f:
+        yaml.safe_dump(meta, f)
+    mzmls = list(mzml_dir.rglob("*.mzML")) + list(mzml_dir.rglob("*.mzml"))
     print(f"Found {len(mzmls)} mzML files")
     
     if workers <= 1:
         for f in tqdm(mzmls, desc="mzML->voxel"):
-            result = _convert_mzml_file((f, voxel_dir, cleanup_mzml, mz_bin, mz_parent_bin, rt_bin_sec))
+            result = _convert_mzml_file((f, voxel_dir, cleanup_mzml, force_voxel, mz_bin, mz_parent_bin, rt_bin_sec))
             if "❌" in result or "🗑️" in result:
                 print(f"   {result}")
     else:
-        args_list = [(f, voxel_dir, cleanup_mzml, mz_bin, mz_parent_bin, rt_bin_sec) for f in mzmls]
+        args_list = [(f, voxel_dir, cleanup_mzml, force_voxel, mz_bin, mz_parent_bin, rt_bin_sec) for f in mzmls]
         with ProcessPoolExecutor(max_workers=workers) as executor:
             futures = [executor.submit(_convert_mzml_file, args) for args in args_list]
             # Step 2: mzML -> voxel (with mode-based folder split)
             print(f"\n🔄 Step 2/3: Converting mzML to voxels (workers={workers}, mode-based folders)")
             voxel_dir.mkdir(parents=True, exist_ok=True)
-            mzmls = list(mzml_dir.rglob("*.mzML"))
+            mzmls = list(mzml_dir.rglob("*.mzML")) + list(mzml_dir.rglob("*.mzml"))
             print(f"Found {len(mzmls)} mzML files")
 
             if workers <= 1:
                 for f in tqdm(mzmls, desc="mzML->voxel (mode split)"):
-                    result = _convert_mzml_file((f, voxel_dir, cleanup_mzml, mz_bin, mz_parent_bin, rt_bin_sec))
+                    result = _convert_mzml_file((f, voxel_dir, cleanup_mzml, force_voxel, mz_bin, mz_parent_bin, rt_bin_sec))
                     if "❌" in result or "🗑️" in result:
                         print(f"   {result}")
             else:
-                args_list = [(f, voxel_dir, cleanup_mzml, mz_bin, mz_parent_bin, rt_bin_sec) for f in mzmls]
+                args_list = [(f, voxel_dir, cleanup_mzml, force_voxel, mz_bin, mz_parent_bin, rt_bin_sec) for f in mzmls]
                 with ProcessPoolExecutor(max_workers=workers) as executor:
                     futures = [executor.submit(_convert_mzml_file, args) for args in args_list]
                     for future in tqdm(as_completed(futures), total=len(mzmls), desc="mzML->voxel (mode split)"):
@@ -935,6 +1342,7 @@ def main():
     p4.add_argument("--mz-parent-bin", type=float, default=1.0)
     p4.add_argument("--rt-bin-sec", type=float, default=1.0)
     p4.add_argument("--workers", type=int, default=10, help="Number of parallel workers for conversions (default=1)")
+    p4.add_argument("--force", action="store_true", help="Re-convert mzML even if voxel exists")
 
     p5 = sub.add_parser("window")
     p5.add_argument("--voxel-dir", required=True)
@@ -947,6 +1355,7 @@ def main():
     p6.add_argument("--cleanup-raw", action="store_true", help="Delete .raw files after converting to mzML")
     p6.add_argument("--cleanup-mzml", action="store_true", help="Delete .mzML files after converting to voxel")
     p6.add_argument("--force-raw", action="store_true", help="Re-convert RAW even if mzML exists")
+    p6.add_argument("--force-voxel", action="store_true", help="Re-convert mzML even if voxel exists")
     p6.add_argument("--mz-bin", type=float, default=1.0)
     p6.add_argument("--mz-parent-bin", type=float, default=1.0)
     p6.add_argument("--rt-bin-sec", type=float, default=1.0)
@@ -1075,14 +1484,14 @@ def main():
         mzml_dir = Path(args.mzml_dir)
         voxel_dir = Path(args.voxel_dir)
         voxel_dir.mkdir(parents=True, exist_ok=True)
-        files = list(mzml_dir.rglob("*.mzML"))
+        files = list(mzml_dir.rglob("*.mzML")) + list(mzml_dir.rglob("*.mzml"))
 
         if args.workers <= 1:
             for f in tqdm(files, desc="mzML->voxel"):
-                print(convert_one(f, voxel_dir, args.mz_bin, args.mz_parent_bin, args.rt_bin_sec))
+                print(convert_one(f, voxel_dir, args.mz_bin, args.mz_parent_bin, args.rt_bin_sec, force=args.force))
         else:
             with ProcessPoolExecutor(max_workers=args.workers) as executor:
-                futures = [executor.submit(convert_one, f, voxel_dir, args.mz_bin, args.mz_parent_bin, args.rt_bin_sec) for f in files]
+                futures = [executor.submit(convert_one, f, voxel_dir, args.mz_bin, args.mz_parent_bin, args.rt_bin_sec, args.force) for f in files]
                 for future in tqdm(as_completed(futures), total=len(futures), desc="mzML->voxel (parallel)"):
                     result = future.result()
                     print(result)
@@ -1097,6 +1506,7 @@ def main():
             cleanup_raw=args.cleanup_raw,
             cleanup_mzml=args.cleanup_mzml,
             force_raw=args.force_raw,
+            force_voxel=args.force_voxel,
             mz_bin=args.mz_bin,
             mz_parent_bin=args.mz_parent_bin,
             rt_bin_sec=args.rt_bin_sec,

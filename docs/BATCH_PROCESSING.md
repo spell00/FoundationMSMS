@@ -8,6 +8,16 @@ The batch processing system supports:
 - **Automatic cleanup** of intermediate files to save space
 - **Priority-based processing** (small files with many samples first)
 
+```mermaid
+flowchart TD
+    A[batch-download] --> B[pipeline]
+    B --> C[RAW -> mzML]
+    B --> D[mzML -> voxel]
+    B --> E[windowing]
+    D --> F[build_scenario_from_voxel]
+    F --> G[training + EDA]
+```
+
 ## Quick Start
 
 ### 1. Download Priority 1 Datasets (parallel)
@@ -65,6 +75,8 @@ Run full processing pipeline: raw → mzml → voxel → windows.
 - `--output-base`: Base output directory
 - `--cleanup-raw`: Delete .raw files after converting to mzML (saves space!)
 - `--cleanup-mzml`: Delete .mzML files after converting to voxel (saves space!)
+- `--force-raw`: Re-convert RAW even if mzML exists
+- `--force-voxel`: Re-convert mzML even if voxel exists
 - `--mz-bin`: m/z binning for fragments (default=1.0)
 - `--mz-parent-bin`: m/z binning for precursors (default=1.0)
 - `--rt-bin-sec`: RT binning in seconds (default=1.0)
@@ -106,6 +118,16 @@ python -m foundationmsms.preprocessing mzml-to-voxel \
     --workers 4
 ```
 Set --workers to the number of parallel processes you want (default is 1).
+
+Force re-conversion for existing voxels:
+
+```bash
+python -m foundationmsms.preprocessing mzml-to-voxel \
+    --mzml-dir data/mzml/PXD012353 \
+    --voxel-dir data/voxel/PXD012353 \
+    --workers 4 \
+    --force
+```
 
 **Create temporal windows:**
 ```bash

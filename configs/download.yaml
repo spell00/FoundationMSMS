@@ -1,22 +1,32 @@
+# For PRIDE datasets that also exist on MassIVE, set massive_id + ftp_url.
+# The downloader will prefer MassIVE (mzML already pre-processed) and only
+# fall back to PRIDE RAW download if MassIVE is unavailable.
+# Set mzml_only: true (default when massive_id is present) to skip non-mzML files.
 pride_datasets:
-  - id: PXD050291
+  - pride_id: PXD050291
     name: "Large-scale urinary proteomics DIA benchmark"
-    priority: 1
+    priority: 0
 
-  - id: PXD047676
+  - pride_id: PXD047676
     name: "DIA Exploris 480 Evosep dataset"
-    priority: 1
+    priority: 0
+    massive_id: MSV000093624
+    ftp_url: "ftp://massive-ftp.ucsd.edu/v06/MSV000093624/"
 
-  - id: PXD016662
+  - pride_id: PXD016662
     name: "Short-gradient DIA benchmark dataset"
+    priority: 0
+    ftp_url: "ftp://ftp.pride.ebi.ac.uk/pride/data/archive/2020/02/PXD016662"
+
+  - pride_id: PXD012353
+    name: "PXD012353"
     priority: 1
+    ftp_url: "ftp://ftp.pride.ebi.ac.uk/pride/data/archive/2019/09/PXD012353"
 
 massive_datasets:
-  # Keep MassIVE accessions uppercase (MSV...) for downloader validation.
-  - id: MSV000083793
-    name: "MassIVE msv000083793 benchmark dataset"
+  - massive_id: MSV000083793
+    name: "MassIVE MSV000083793 benchmark dataset"
     priority: 1
+    ftp_url: "ftp://massive-ftp.ucsd.edu/v02/MSV000083793/ccms_peak/DIA_raw/"
+    mzml_only: true
 
-# Convention:
-# - priority > 0: included in run_experiment download + scenario build
-# - priority = 0: excluded (listed for record, but skipped)

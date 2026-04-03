@@ -82,6 +82,8 @@ def mzml_to_voxel_npz(
                 coords.append((pbin, fbin, tbin))
                 vals.append(v)
 
+    # Per-file metadata writing removed; now handled per parameter set folder
+
     if len(vals) == 0:
         np.savez_compressed(out_npz, coords=np.zeros((0, 3), np.int32), vals=np.zeros((0,), np.float32))
         return
@@ -121,10 +123,31 @@ def massive_mzml_to_voxel(
 
     mzml_dir = Path(mzml_dir)
     voxel_dir = Path(voxel_dir)
-    voxel_dir.mkdir(parents=True, exist_ok=True)
     files = list(mzml_dir.rglob("*.mzML"))
+    # Write a single metadata file for this parameter set
+    import yaml
+    # Always write to a parameter-named subfolder based on function arguments
+    param_folder = f"mzbin_{mz_bin}_mzparent_{mz_parent_bin}_rtbin_{rt_bin_sec}"
+    out_dir = voxel_dir / param_folder
+    out_dir.mkdir(parents=True, exist_ok=True)
+    meta = {
+        "mzml_dir": str(mzml_dir),
+        "mz_bin": mz_bin,
+        "mz_parent_bin": mz_parent_bin,
+        "rt_bin_sec": rt_bin_sec,
+        "mz_range": [100.0, 2000.0],
+        "mz_parent_range": [300.0, 2000.0],
+        "rt_range_sec": None,
+        "ms2_only": True,
+        "intensity_transform": "log1p",
+        "voxel_files": [str(out_dir / (f.stem + ".npz")) for f in files],
+    }
+    meta_path = out_dir / "voxelization_params.yaml"
+    with open(meta_path, "w") as f:
+        yaml.safe_dump(meta, f)
+
     for f in tqdm(files, desc="mzML->voxel (massive)"):
-        out = voxel_dir / (f.stem + ".npz")
+        out = out_dir / (f.stem + ".npz")
         try:
             mzml_to_voxel_npz(
                 f,

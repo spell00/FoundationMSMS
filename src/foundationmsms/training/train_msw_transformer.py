@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import statistics
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Tuple
@@ -219,6 +220,22 @@ def collate_recon(batch: Sequence[Tuple[torch.Tensor, torch.Tensor]]):
     return padded_idx, padded_val, mask
 
 
+def collate_recon_with_dataset(batch: Sequence[Tuple[torch.Tensor, torch.Tensor]]):
+    # Accepts (idx, val, dataset, origin) and preserves dataset IDs for logging.
+    idxs, vals = zip(*[(b[0], b[1]) for b in batch])
+    datasets = [str(b[2]) if len(b) > 2 else "default" for b in batch]
+    max_len = max(x.shape[0] for x in idxs)
+    padded_idx = torch.zeros(len(batch), max_len, dtype=torch.long)
+    padded_val = torch.zeros(len(batch), max_len, dtype=torch.float32)
+    mask = torch.zeros(len(batch), max_len, dtype=torch.bool)
+    for i, (idx, val) in enumerate(zip(idxs, vals)):
+        length = idx.shape[0]
+        padded_idx[i, :length] = idx
+        padded_val[i, :length] = val
+        mask[i, :length] = True
+    return padded_idx, padded_val, mask, datasets
+
+
 def collate_clf(batch: Sequence[Tuple[torch.Tensor, torch.Tensor, int]], vocab: int):
     # Accept (idx, val, label, origin, dataset) or (idx, val, label, origin) or (idx, val, label)
     if len(batch[0]) == 5:
@@ -289,18 +306,24 @@ def describe_docs(tokens_idx: Iterable, logger) -> List[int]:
         logger.info("No documents to summarize")
         return []
 
+    non_empty = [l for l in lengths if l > 0]
+    if not non_empty:
+        logger.info("Documents=%d but all are empty", len(lengths))
+        return lengths
+
     def pct(p: float) -> float:
-        return float(np.percentile(lengths, p))
+        return float(np.percentile(non_empty, p))
 
     logger.info(
-        "Documents=%d tokens/doc avg=%.1f min=%d p50=%.1f p90=%.1f p99=%.1f max=%d",
+        "Documents=%d non_empty=%d tokens/non_empty_doc avg=%.1f min=%d p50=%.1f p90=%.1f p99=%.1f max=%d",
         len(lengths),
-        statistics.mean(lengths),
-        min(lengths),
+        len(non_empty),
+        statistics.mean(non_empty),
+        min(non_empty),
         pct(50),
         pct(90),
         pct(99),
-        max(lengths),
+        max(non_empty),
     )
     return lengths
 
@@ -339,17 +362,6 @@ class TrainingRunner:
         self.cfg = cfg
         self.args = args
         self.logger = get_logger("msw_train")
-        self.ExperimentConfig = ExperimentConfig
-        self.init_experiment = init_experiment
-        self.log_metric = log_metric
-        self.exp_config = ExperimentConfig(
-            log_dir=args.log_dir,
-            run_name=args.run_name,
-            project="foundationmsms",
-            use_tensorboard=True,
-            use_comet=True,
-        )
-        self.writers = self.init_experiment(self.exp_config)
         self.device = None
         self.model = None
         self.embed = None
@@ -427,7 +439,8 @@ class TrainingRunner:
         if self.cfg.task in {"recon", "joint"}:
             head_recon = nn.Linear(model_cfg.dim, 1)
         if self.cfg.task in {"clf", "joint"}:
-            for dsid in self.dataset_ids:
+            # Deterministic order avoids optimizer-state/parameter misalignment across resumes.
+            for dsid in sorted(self.dataset_ids):
                 if any(d == dsid for d in self.sample_to_dataset):
                     n_classes = len(set(l for d, l in zip(self.sample_to_dataset, self.label_values) if d == dsid))
                     if n_classes > 1:
@@ -472,6 +485,8 @@ class TrainingRunner:
             else:
                 head_clf.eval()
         recon_loss_sum = 0.0
+        recon_loss_sum_ds = {dsid: 0.0 for dsid in getattr(self, 'dataset_ids', set())}
+        recon_count_ds = {dsid: 0 for dsid in getattr(self, 'dataset_ids', set())}
         clf_loss_sum = {dsid: 0.0 for dsid in head_clf.keys()}
         clf_correct = {dsid: 0 for dsid in head_clf.keys()}
         clf_total = {dsid: 0 for dsid in head_clf.keys()}
@@ -508,6 +523,14 @@ class TrainingRunner:
                     masked_pred = pred_recon[recon_mask]
                     masked_val = val[recon_mask]
                     recon_loss_sum += torch.mean((masked_pred - masked_val) ** 2).item()
+                    if batch_datasets is not None:
+                        for i in range(len(idx)):
+                            dsid = batch_datasets[i]
+                            if dsid in recon_loss_sum_ds:
+                                s_mask = recon_mask[i]
+                                if s_mask.any():
+                                    recon_loss_sum_ds[dsid] += torch.mean((pred_recon[i][s_mask] - val[i][s_mask]) ** 2).item()
+                                    recon_count_ds[dsid] += 1
 
                 if self.cfg.task in {"clf", "joint"} and head_clf is not None and ce_loss is not None and labels_tensor is not None and batch_datasets is not None:
                     for i in range(len(idx)):
@@ -546,6 +569,7 @@ class TrainingRunner:
         metrics = {
                     "batches": batch_count,
                     "recon_loss": recon_loss_sum / max(1, batch_count),
+                    "recon_loss_ds": {dsid: recon_loss_sum_ds[dsid] / recon_count_ds[dsid] for dsid in recon_loss_sum_ds if recon_count_ds[dsid] > 0},
                     "clf_loss": {dsid: (clf_loss_sum[dsid] / max(1, batch_count)) for dsid in clf_loss_sum},
                     "acc": acc_dict,
                     "mcc": mcc_dict,
@@ -619,6 +643,7 @@ def run_training(cfg: TrainConfig, args) -> None:
     exp_config = ExperimentConfig(
         log_dir=args.log_dir,
         run_name=args.run_name,
+        auto_run_subdir=True,
         project="foundationmsms",
         use_tensorboard=True,
         use_comet=True,
@@ -662,32 +687,34 @@ def run_training(cfg: TrainConfig, args) -> None:
     logger.info("Loaded scenario %s kind=%s docs=%d", cfg.scenario_path, kind, len(parent_bins))
     lengths = describe_docs(tokens_idx, logger)
 
+    total_docs = int(len(lengths))
+    non_empty_docs = int(sum(1 for l in lengths if l > 0))
+    if total_docs == 0 or non_empty_docs == 0:
+        scenario_kind = str(kind) if kind is not None else "unknown"
+        raise ValueError(
+            "Scenario has no trainable documents: "
+            f"path={cfg.scenario_path} kind={scenario_kind} total_docs={total_docs} non_empty_docs={non_empty_docs}. "
+            "Likely causes: voxelization did not produce voxel files for included datasets, or the scenario include list "
+            "did not match available voxel directories. Rebuild the scenario after preprocessing and verify data/voxel "
+            "contains dataset *.npz files for each included ID."
+        )
+
     if cfg.task in {"clf", "joint"} and labels is None:
         raise ValueError("Classification task requires 'labels' in scenario NPZ")
 
     # Dataset/label summary
     dataset_ids = set()
     sample_to_dataset = []
-    label_summary = {}  # Ensure label_summary is always defined
+    label_summary = {}  # dsid -> sorted list of unique non-None label strings
     if dataset_ids_arr is not None:
         sample_to_dataset = list(dataset_ids_arr)
         dataset_ids = set(sample_to_dataset)
-    # if labels is not None and hasattr(labels[0], '__iter__') and not isinstance(labels[0], str) and dataset_ids_arr is None:
-        # e.g. [(PXD012353, 0), (PXD028735, 1), ...] (legacy format)
-    #     for lab in labels:
-    #         dataset_ids.add(lab[0])
-    #         sample_to_dataset.append(lab[0])
-    #     label_values = [lab[1] for lab in labels]
-        # Build label summary for each dataset
-    #     for dsid in dataset_ids:
-    #         ds_labels = [lab[1] for lab in labels if lab[0] == dsid]
-    #         label_summary[dsid] = sorted(set(ds_labels))
-    # else:
-    #     dataset_ids = dataset_ids or {"default"}
-    #     sample_to_dataset = sample_to_dataset or (["default"] * len(labels) if labels is not None else [])
-    #     label_values = labels
-    #     if labels is not None:
-    #         label_summary["default"] = sorted(set(labels))
+    # Build label_summary: for each dataset, collect the set of distinct non-None labels.
+    if labels is not None and sample_to_dataset:
+        for dsid, lab in zip(sample_to_dataset, labels):
+            if lab is not None and str(lab).strip() not in ("", "None", "nan", "unknown"):
+                label_summary.setdefault(str(dsid), set()).add(str(lab))
+        label_summary = {k: sorted(v) for k, v in label_summary.items()}
 
     # Print dataset usage summary
     label_values = labels if labels is not None else None
@@ -726,6 +753,64 @@ def run_training(cfg: TrainConfig, args) -> None:
 
     folds = np.array_split(remain_idx, cfg.cv_folds) if cfg.cv_folds > 1 else [remain_idx]
 
+    def _state_dict_to_cpu(state_dict: dict) -> dict:
+        cpu_state = {}
+        for k, v in state_dict.items():
+            if torch.is_tensor(v):
+                cpu_state[k] = v.detach().cpu().clone()
+            else:
+                cpu_state[k] = copy.deepcopy(v)
+        return cpu_state
+
+    def _optimizer_state_shapes_match(optimizer: torch.optim.Optimizer) -> bool:
+        for group in optimizer.param_groups:
+            for p in group.get("params", []):
+                state = optimizer.state.get(p, None)
+                if not state:
+                    continue
+                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                    t = state.get(key)
+                    if torch.is_tensor(t) and tuple(t.shape) != tuple(p.shape):
+                        return False
+        return True
+
+    def _load_state_dict_compatible(module: nn.Module, incoming_state: Optional[dict], module_name: str) -> None:
+        if incoming_state is None:
+            logger.warning("No state found for %s; leaving it freshly initialized.", module_name)
+            return
+
+        current_state = module.state_dict()
+        filtered_state = {}
+        skipped = []
+
+        for key, value in incoming_state.items():
+            if key not in current_state:
+                skipped.append(f"{key} (missing key)")
+                continue
+            current_value = current_state[key]
+            if torch.is_tensor(value) and torch.is_tensor(current_value):
+                if tuple(value.shape) != tuple(current_value.shape):
+                    skipped.append(f"{key} (shape {tuple(value.shape)} != {tuple(current_value.shape)})")
+                    continue
+            filtered_state[key] = value
+
+        module.load_state_dict(filtered_state, strict=False)
+
+        missing_count = len(current_state) - len(filtered_state)
+        if skipped or missing_count:
+            skipped_preview = ", ".join(skipped[:5])
+            if len(skipped) > 5:
+                skipped_preview += ", ..."
+            logger.warning(
+                "Loaded %s partially: loaded=%d missing_or_skipped=%d details=%s",
+                module_name,
+                len(filtered_state),
+                missing_count + len(skipped),
+                skipped_preview or "state_dict did not include all required keys",
+            )
+        else:
+            logger.info("Loaded %s state_dict with %d tensors.", module_name, len(filtered_state))
+
     def make_loader(indices: Optional[np.ndarray], shuffle: bool) -> Optional[DataLoader]:
         if indices is None or len(indices) == 0:
             return None
@@ -756,22 +841,35 @@ def run_training(cfg: TrainConfig, args) -> None:
     except ImportError:
         scaler = GradScaler() if device.type == "cuda" else None
         autocast_device = None
-    # Try to load previous warmup/model if available
-    loaded_warmup = False
-    if os.path.exists(args.warmup_out):
-        logger.info(f"Found previous warmup/model file: {args.warmup_out}, loading weights...")
-        try:
-            state = torch.load(args.warmup_out, map_location=device, weights_only=True)
-            model.load_state_dict(state['model'])
-            embed.load_state_dict(state['embed'])
-            if head_recon is not None and state.get('head_recon') is not None:
-                head_recon.load_state_dict(state['head_recon'])
-            loaded_warmup = True
-        except Exception as e:
-            logger.warning(f"Failed to load warmup/model file: {e}")
-    import os
-    checkpoint_dir = os.path.join(os.getcwd(), "checkpoints")
+    run_id = writers.get("run_name") or args.run_name or "run"
+    checkpoint_dir = os.path.join(args.log_dir, run_id, "checkpoints")
     os.makedirs(checkpoint_dir, exist_ok=True)
+    logger.info("Checkpoint directory: %s", checkpoint_dir)
+
+    requested_warmup_out = args.warmup_out
+    warmup_ckpt_path = os.path.join(checkpoint_dir, f"warmup_{os.path.basename(requested_warmup_out)}")
+    args.warmup_out = warmup_ckpt_path
+
+    # Try to load previous warmup/model if available.
+    loaded_warmup = False
+    warmup_load_candidates = [warmup_ckpt_path]
+    if requested_warmup_out not in warmup_load_candidates:
+        warmup_load_candidates.append(requested_warmup_out)
+    for warmup_candidate in warmup_load_candidates:
+        if not os.path.exists(warmup_candidate):
+            continue
+        logger.info("Found previous warmup/model file: %s, loading weights...", warmup_candidate)
+        try:
+            state = torch.load(warmup_candidate, map_location=device, weights_only=False)
+            _load_state_dict_compatible(model, state.get('model'), "model")
+            _load_state_dict_compatible(embed, state.get('embed'), "embed")
+            if head_recon is not None and state.get('head_recon') is not None:
+                _load_state_dict_compatible(head_recon, state.get('head_recon'), "head_recon")
+            loaded_warmup = True
+            break
+        except Exception as e:
+            logger.warning("Failed to load warmup/model file %s: %s", warmup_candidate, e)
+
     global_step = 0
     resume_loaded = False
     resume_fold_idx = 0
@@ -780,23 +878,63 @@ def run_training(cfg: TrainConfig, args) -> None:
     resume_epochs_no_improve = None
 
     if args.resume_checkpoint:
-        if os.path.exists(args.resume_checkpoint):
-            logger.info("Loading full resume checkpoint from %s", args.resume_checkpoint)
-            state = torch.load(args.resume_checkpoint, map_location=device, weights_only=True)
-            model.load_state_dict(state["model"])
-            embed.load_state_dict(state["embed"])
+        resume_candidates = [args.resume_checkpoint]
+        if not os.path.isabs(args.resume_checkpoint):
+            resume_candidates.append(os.path.join(checkpoint_dir, args.resume_checkpoint))
+            resume_candidates.append(os.path.join(checkpoint_dir, os.path.basename(args.resume_checkpoint)))
+        resume_path = next((p for p in resume_candidates if os.path.exists(p)), None)
+        if resume_path is not None:
+            logger.info("Loading full resume checkpoint from %s", resume_path)
+            state = torch.load(resume_path, map_location=device, weights_only=False)
+            ckpt_cfg = state.get("cfg") or {}
+            ckpt_heads = ckpt_cfg.get("heads")
+            heads_mismatch = ckpt_heads is not None and int(ckpt_heads) != int(cfg.heads)
+            if heads_mismatch:
+                logger.warning(
+                    "Checkpoint was trained with heads=%s but current run uses heads=%s. "
+                    "Model weights will be loaded in compatible mode; optimizer/schedulers will be reset.",
+                    ckpt_heads,
+                    cfg.heads,
+                )
+
+            _load_state_dict_compatible(model, state.get("model"), "model")
+            _load_state_dict_compatible(embed, state.get("embed"), "embed")
             if head_recon is not None and state.get("head_recon") is not None:
-                head_recon.load_state_dict(state["head_recon"])
+                _load_state_dict_compatible(head_recon, state.get("head_recon"), "head_recon")
             head_clf_state = state.get("head_clf")
             if head_clf_state and head_clf:
                 for dsid, sd in head_clf_state.items():
                     if dsid in head_clf:
-                        head_clf[dsid].load_state_dict(sd)
-            if state.get("optimizer") is not None:
-                opt.load_state_dict(state["optimizer"])
-            if state.get("warmup_scheduler") is not None and warmup_scheduler is not None:
+                        _load_state_dict_compatible(head_clf[dsid], sd, f"head_clf[{dsid}]")
+            if state.get("optimizer") is not None and not heads_mismatch:
+                try:
+                    ckpt_opt = state["optimizer"]
+                    ckpt_param_count = sum(len(g.get("params", [])) for g in ckpt_opt.get("param_groups", []))
+                    cur_param_count = sum(len(g.get("params", [])) for g in opt.param_groups)
+                    ckpt_head_order = list((state.get("head_clf") or {}).keys())
+                    cur_head_order = list((head_clf or {}).keys())
+                    if ckpt_param_count != cur_param_count or ckpt_head_order != cur_head_order:
+                        logger.warning(
+                            "Resume optimizer state is incompatible (param count/order changed). "
+                            "Skipping optimizer-state load and continuing with fresh optimizer moments."
+                        )
+                        opt.state.clear()
+                    else:
+                        opt.load_state_dict(ckpt_opt)
+                    if not _optimizer_state_shapes_match(opt):
+                        logger.warning(
+                            "Resume optimizer state has incompatible tensor shapes for current model; resetting optimizer state."
+                        )
+                        opt.state.clear()
+                except Exception as e:
+                    logger.warning("Failed to load optimizer state from resume checkpoint: %s. Continuing with fresh optimizer state.", e)
+                    opt.state.clear()
+            elif state.get("optimizer") is not None and heads_mismatch:
+                opt.state.clear()
+
+            if state.get("warmup_scheduler") is not None and warmup_scheduler is not None and not heads_mismatch:
                 warmup_scheduler.load_state_dict(state["warmup_scheduler"])
-            if state.get("main_scheduler") is not None and main_scheduler is not None:
+            if state.get("main_scheduler") is not None and main_scheduler is not None and not heads_mismatch:
                 main_scheduler.load_state_dict(state["main_scheduler"])
             global_step = int(state.get("global_step", 0))
             resume_fold_idx = int(state.get("fold_idx", 0))
@@ -811,10 +949,19 @@ def run_training(cfg: TrainConfig, args) -> None:
                 global_step,
             )
         else:
-            logger.warning("Resume checkpoint not found: %s", args.resume_checkpoint)
+            logger.warning("Resume checkpoint not found. Tried: %s", resume_candidates)
     if args.warmup_epochs > 0:
         logger.info(f"Starting warmup phase: {args.warmup_epochs} epochs (unsupervised reconstruction only)")
         logger.info(f"[warmup] Using device: {device}")
+        # For clf-only tasks, head_recon is None; create a temporary one for warmup.
+        _warmup_head_recon_tmp = None
+        if head_recon is None:
+            _warmup_head_recon_tmp = nn.Linear(cfg.dim, 1).to(device)
+            head_recon = _warmup_head_recon_tmp
+            logger.info("[warmup] Created temporary head_recon for warmup (task=%s)", cfg.task)
+        # Build warmup optimizer (must include temp head_recon if newly created).
+        warmup_params = list(model.parameters()) + list(embed.parameters()) + list(head_recon.parameters())
+        warmup_opt = torch.optim.Adam(warmup_params, lr=cfg.lr)
         if device.type == "cuda":
             check_model = model.module if hasattr(model, "module") else model
             if not next(check_model.parameters()).is_cuda:
@@ -825,7 +972,7 @@ def run_training(cfg: TrainConfig, args) -> None:
                 raise RuntimeError("head_recon is not on CUDA during warmup!")
         dataset_warmup = DocDataset(tokens_idx, tokens_val, labels=label_values, max_seq_len=args.max_seq_len, chunk_overlap=args.chunk_overlap, sample_to_dataset=sample_to_dataset)
         indices_warmup = range(len(dataset_warmup))
-        collate_fn_warmup = collate_recon
+        collate_fn_warmup = collate_recon_with_dataset
         train_loader_warmup = DataLoader(torch.utils.data.Subset(dataset_warmup, list(indices_warmup)), batch_size=cfg.batch_size, shuffle=True, collate_fn=collate_fn_warmup)
         model.train()
         embed.train()
@@ -833,10 +980,12 @@ def run_training(cfg: TrainConfig, args) -> None:
             head_recon.train()
         for epoch in range(args.warmup_epochs):
             recon_loss_sum = 0.0
+            recon_loss_sum_ds = defaultdict(float)
+            recon_count_ds = defaultdict(int)
             batch_count = 0
             pbar = tqdm(train_loader_warmup, desc=f"Warmup Epoch {epoch+1}/{args.warmup_epochs}", leave=False)
             step = 0
-            for idx, val, mask in pbar:
+            for idx, val, mask, batch_datasets in pbar:
                 idx = idx.to(device)
                 val = val.to(device)
                 mask = mask.to(device)
@@ -859,24 +1008,29 @@ def run_training(cfg: TrainConfig, args) -> None:
                         masked_pred = pred_recon[mask]
                         masked_val = val[mask]
                         recon_loss = torch.mean((masked_pred - masked_val) ** 2)
-                    tok = embed(idx)
-                    out = model(tok)
-                    pred_recon = head_recon(out).squeeze(-1)
-                    masked_pred = pred_recon[mask]
-                    masked_val = val[mask]
-                    recon_loss = torch.mean((masked_pred - masked_val) ** 2)
-                opt.zero_grad()
+                warmup_opt.zero_grad()
                 if scaler:
                     scaler.scale(recon_loss).backward()
-                    scaler.step(opt)
+                    scaler.step(warmup_opt)
                     scaler.update()
                 else:
                     recon_loss.backward()
-                    opt.step()
+                    warmup_opt.step()
 
                 step += 1
                 batch_count += 1
                 recon_loss_sum += recon_loss.item()  # <-- accumulate loss here
+                with torch.no_grad():
+                    pred_eval = pred_recon.detach()
+                    val_eval = val.detach()
+                    mask_eval = mask.detach()
+                    for i, dsid in enumerate(batch_datasets):
+                        dsid = str(dsid)
+                        s_mask = mask_eval[i]
+                        if s_mask.any():
+                            s_loss = torch.mean((pred_eval[i][s_mask] - val_eval[i][s_mask]) ** 2).item()
+                            recon_loss_sum_ds[dsid] += float(s_loss)
+                            recon_count_ds[dsid] += 1
                 pbar.set_postfix({"recon_loss": f"{recon_loss.item():.4f}"})
                 if args.n_steps_per_warmup_epoch is not None and step >= args.n_steps_per_warmup_epoch:
                     break
@@ -885,17 +1039,44 @@ def run_training(cfg: TrainConfig, args) -> None:
                 warmup_scheduler.step()
             if batch_count:
                 avg_recon_loss = recon_loss_sum / batch_count
+                avg_recon_loss_ds = {
+                    dsid: recon_loss_sum_ds[dsid] / recon_count_ds[dsid]
+                    for dsid in recon_loss_sum_ds
+                    if recon_count_ds[dsid] > 0
+                }
                 logger.info(f"[warmup] epoch={epoch+1}/{args.warmup_epochs} recon_loss={avg_recon_loss:.4f} batches={batch_count}")
+                if avg_recon_loss_ds:
+                    logger.info(
+                        "[warmup] epoch=%d/%d recon_loss_ds=%s",
+                        epoch + 1,
+                        args.warmup_epochs,
+                        {dsid_to_clf_name.get(dsid, dsid): round(v, 4) for dsid, v in avg_recon_loss_ds.items()},
+                    )
                 log_metric(writers, "warmup/recon_loss", avg_recon_loss, step=global_step)
+                for dsid, value in avg_recon_loss_ds.items():
+                    log_metric(writers, "warmup/recon_loss", value, step=global_step, head=dsid)
+
+                warmup_state = {
+                    'model': model.state_dict(),
+                    'embed': embed.state_dict(),
+                    'head_recon': head_recon.state_dict() if head_recon is not None else None,
+                    'epoch': epoch + 1,
+                    'global_step': global_step,
+                    'cfg': {
+                        'dim': cfg.dim,
+                        'heads': cfg.heads,
+                        'windows': cfg.windows,
+                    },
+                }
+                torch.save(warmup_state, warmup_ckpt_path)
+                logger.info("[warmup] saved checkpoint: %s", warmup_ckpt_path)
             global_step += 1
-        warmup_ckpt_path = os.path.join(checkpoint_dir, f"warmup_{os.path.basename(args.warmup_out)}")
-        torch.save({
-            'model': model.state_dict(),
-            'embed': embed.state_dict(),
-            'head_recon': head_recon.state_dict() if head_recon is not None else None,
-        }, warmup_ckpt_path)
         logger.info(f"Warmup phase complete. Model saved to {warmup_ckpt_path}")
         args.warmup_out = warmup_ckpt_path
+        # Discard temporary head_recon created for warmup (not used in main training for clf tasks).
+        if _warmup_head_recon_tmp is not None:
+            head_recon = None
+            _warmup_head_recon_tmp = None
     # --- Main training loop continues below ---
     num_folds = cfg.cv_folds if cfg.cv_folds > 1 else 1
     best_val_score_across_folds = float("inf")
@@ -917,11 +1098,11 @@ def run_training(cfg: TrainConfig, args) -> None:
         # Reload model from warmup before each fold, unless resuming mid-fold.
         if not (resume_loaded and fold_idx == resume_fold_idx):
             logger.info(f"Reloading model from {args.warmup_out} for main training phase")
-            state = torch.load(args.warmup_out, map_location=device, weights_only=True)
-            model.load_state_dict(state['model'])
-            embed.load_state_dict(state['embed'])
+            state = torch.load(args.warmup_out, map_location=device, weights_only=False)
+            _load_state_dict_compatible(model, state.get('model'), "model")
+            _load_state_dict_compatible(embed, state.get('embed'), "embed")
             if head_recon is not None and state.get('head_recon') is not None:
-                head_recon.load_state_dict(state['head_recon'])
+                _load_state_dict_compatible(head_recon, state.get('head_recon'), "head_recon")
         else:
             logger.info("Continuing from resumed in-fold state for fold %d", fold_idx + 1)
 
@@ -977,6 +1158,8 @@ def run_training(cfg: TrainConfig, args) -> None:
             logger.info(msg)
             print(msg, flush=True)
             recon_loss_sum = 0.0
+            recon_loss_sum_ds = {dsid: 0.0 for dsid in dataset_ids}
+            recon_count_ds = {dsid: 0 for dsid in dataset_ids}
             clf_loss_sum = {dsid: 0.0 for dsid in head_clf.keys()}
             clf_correct = {dsid: 0 for dsid in head_clf.keys()}
             clf_total = {dsid: 0 for dsid in head_clf.keys()}
@@ -1026,6 +1209,14 @@ def run_training(cfg: TrainConfig, args) -> None:
                             masked_val = val[recon_mask]
                             recon_loss = torch.mean((masked_pred - masked_val) ** 2)
                             recon_loss_sum += recon_loss.item()
+                            if batch_datasets is not None:
+                                for i in range(len(idx)):
+                                    dsid = batch_datasets[i]
+                                    if dsid in recon_loss_sum_ds:
+                                        s_mask = recon_mask[i]
+                                        if s_mask.any():
+                                            recon_loss_sum_ds[dsid] += torch.mean((pred_recon[i][s_mask] - val[i][s_mask]) ** 2).item()
+                                            recon_count_ds[dsid] += 1
 
                         if cfg.task in {"clf", "joint"} and head_clf is not None and ce_loss is not None and labels_tensor is not None and batch_datasets is not None:
                             # For each sample in batch, use correct head and dataset
@@ -1044,21 +1235,17 @@ def run_training(cfg: TrainConfig, args) -> None:
                                     print(f"[DEBUG] pred_clf_i: {pred_clf_i.detach().cpu().numpy()}")
                                     print(f"[DEBUG] label_i: {label_i.item()}")
                                     print(f"[DEBUG] clf_loss_i: {clf_loss_i.item()}")
+                                clf_loss = clf_loss_i if clf_loss is None else clf_loss + clf_loss_i
                                 clf_loss_sum[dsid] += clf_loss_i.item()
                                 with torch.no_grad():
                                     clf_correct[dsid] += (pred_clf_i.argmax(dim=-1) == label_i).sum().item()
                                     clf_total[dsid] += 1
 
                         if cfg.task == "joint":
-                            # If either loss is missing, set to zero
                             if recon_loss is None:
                                 recon_loss = torch.tensor(0.0, device=idx.device)
                             if clf_loss is None:
-                                # If classification is missing, set loss to zero and optionally predict 'unknown' class
                                 clf_loss = torch.tensor(0.0, device=idx.device)
-                                # Optionally, set all predictions to 'unknown' (class 0)
-                                # If head_clf has 'unknown' class, ensure pred_clf_i = 0 for all samples
-                                # This is handled in the per-sample loop above if needed
                             loss = (cfg.recon_weight * recon_loss) + (cfg.clf_weight * clf_loss)
                         elif cfg.task == "clf":
                             if clf_loss is None:
@@ -1087,6 +1274,14 @@ def run_training(cfg: TrainConfig, args) -> None:
                             masked_val = val[recon_mask]
                             recon_loss = torch.mean((masked_pred - masked_val) ** 2)
                             recon_loss_sum += recon_loss.item()
+                            if batch_datasets is not None:
+                                for i in range(len(idx)):
+                                    dsid = batch_datasets[i]
+                                    if dsid in recon_loss_sum_ds:
+                                        s_mask = recon_mask[i]
+                                        if s_mask.any():
+                                            recon_loss_sum_ds[dsid] += torch.mean((pred_recon[i][s_mask] - val[i][s_mask]) ** 2).item()
+                                            recon_count_ds[dsid] += 1
 
                         if cfg.task in {"clf", "joint"} and head_clf is not None and ce_loss is not None and labels_tensor is not None and batch_datasets is not None:
                             # For each sample in batch, use correct head and dataset
@@ -1105,13 +1300,13 @@ def run_training(cfg: TrainConfig, args) -> None:
                                     print(f"[DEBUG] pred_clf_i: {pred_clf_i.detach().cpu().numpy()}")
                                     print(f"[DEBUG] label_i: {label_i.item()}")
                                     print(f"[DEBUG] clf_loss_i: {clf_loss_i.item()}")
+                                clf_loss = clf_loss_i if clf_loss is None else clf_loss + clf_loss_i
                                 clf_loss_sum[dsid] += clf_loss_i.item()
                                 with torch.no_grad():
                                     clf_correct[dsid] += (pred_clf_i.argmax(dim=-1) == label_i).sum().item()
                                     clf_total[dsid] += 1
 
                         if cfg.task == "joint":
-                            # If either loss is missing, set to zero
                             if recon_loss is None:
                                 recon_loss = torch.tensor(0.0, device=idx.device)
                             if clf_loss is None:
@@ -1126,14 +1321,45 @@ def run_training(cfg: TrainConfig, args) -> None:
                                 raise RuntimeError("Reconstruction loss missing")
                             loss = recon_loss
 
-                opt.zero_grad()
-                if scaler:
-                    scaler.scale(loss).backward()
-                    scaler.step(opt)
-                    scaler.update()
-                else:
-                    loss.backward()
-                    opt.step()
+                opt.zero_grad(set_to_none=True)
+                try:
+                    if scaler:
+                        scaler.scale(loss).backward()
+                        scaler.step(opt)
+                        scaler.update()
+                    else:
+                        loss.backward()
+                        opt.step()
+                except RuntimeError as e:
+                    msg = str(e)
+                    mismatch = "size of tensor a" in msg and "must match the size of tensor b" in msg
+                    if not mismatch:
+                        raise
+                    logger.warning(
+                        "Optimizer state/parameter shape mismatch at fold=%d epoch=%d batch=%d. "
+                        "Resetting optimizer state and skipping this batch.",
+                        fold_idx + 1,
+                        epoch + 1,
+                        batch_idx + 1,
+                    )
+                    opt.state.clear()
+                    opt.zero_grad(set_to_none=True)
+                    if device.type == "cuda":
+                        torch.cuda.empty_cache()
+                    continue
+                except torch.OutOfMemoryError:
+                    if device.type != "cuda":
+                        raise
+                    logger.warning(
+                        "CUDA OOM at fold=%d epoch=%d batch=%d. Skipping batch and clearing cache. "
+                        "Consider lowering --batch-size or --max-seq-len.",
+                        fold_idx + 1,
+                        epoch + 1,
+                        batch_idx + 1,
+                    )
+                    opt.zero_grad(set_to_none=True)
+                    torch.cuda.empty_cache()
+                    continue
 
                 step += 1
                 batch_count += 1
@@ -1164,22 +1390,29 @@ def run_training(cfg: TrainConfig, args) -> None:
                 elif cfg.task == "joint":
                     acc = {dsid: clf_correct[dsid] / max(1, clf_total[dsid]) for dsid in clf_correct}
                     avg_clf_loss = {dsid: clf_loss_sum[dsid] / max(1, batch_count) for dsid in clf_loss_sum}
+                    avg_recon_loss_ds = {dsid: recon_loss_sum_ds[dsid] / recon_count_ds[dsid] for dsid in recon_loss_sum_ds if recon_count_ds[dsid] > 0}
                     logger.info(
-                        "fold=%d epoch=%d recon_loss=%.4f clf_loss=%s acc=%s batches=%d",
+                        "fold=%d epoch=%d recon_loss=%.4f recon_loss_ds=%s clf_loss=%s acc=%s batches=%d",
                         fold_idx + 1,
                         epoch,
                         avg_recon_loss,
+                        {dsid_to_clf_name.get(dsid, dsid): f"{v:.4f}" for dsid, v in avg_recon_loss_ds.items()},
                         {f"{dsid}:{dsid_to_clf_name.get(dsid, dsid)}": avg_clf_loss[dsid] for dsid in avg_clf_loss},
                         {f"{dsid}:{dsid_to_clf_name.get(dsid, dsid)}": acc[dsid] for dsid in acc},
                         batch_count,
                     )
                     log_metric(writers, "train/recon_loss", avg_recon_loss, step=global_step)
+                    for dsid, v in avg_recon_loss_ds.items():
+                        log_metric(writers, "train/recon_loss", v, step=global_step, head=dsid)
                     for dsid in avg_clf_loss:
                         log_metric(writers, f"train/clf_loss", avg_clf_loss[dsid], step=global_step, head=dsid)
                         log_metric(writers, f"train/acc", acc[dsid], step=global_step, head=dsid)
                 else:
-                    logger.info("fold=%d epoch=%d recon_loss=%.4f batches=%d", fold_idx + 1, epoch, avg_recon_loss, batch_count)
+                    avg_recon_loss_ds = {dsid: recon_loss_sum_ds[dsid] / recon_count_ds[dsid] for dsid in recon_loss_sum_ds if recon_count_ds[dsid] > 0}
+                    logger.info("fold=%d epoch=%d recon_loss=%.4f recon_loss_ds=%s batches=%d", fold_idx + 1, epoch, avg_recon_loss, avg_recon_loss_ds, batch_count)
                     log_metric(writers, "train/recon_loss", avg_recon_loss, step=global_step)
+                    for dsid, v in avg_recon_loss_ds.items():
+                        log_metric(writers, "train/recon_loss", v, step=global_step, head=dsid)
 
 
             if val_loader is not None:
@@ -1190,8 +1423,11 @@ def run_training(cfg: TrainConfig, args) -> None:
                     val_score = runner.score_for_early_stop(val_metrics)
                     # Log validation metrics to TensorBoard/Comet
                     if cfg.task == "recon":
-                        logger.info("fold=%d epoch=%d val_recon_loss=%.4f batches=%d", fold_idx + 1, epoch, val_metrics.get("recon_loss", 0.0), val_metrics["batches"])
-                        log_metric(writers, "val/recon_loss", val_metrics.get("recon_loss", 0.0), step=global_step)
+                        val_recon_loss_ds = val_metrics.get("recon_loss_ds", {})
+                        logger.info("fold=%d epoch=%d val_recon_loss=%.4f val_recon_loss_ds=%s batches=%d", fold_idx + 1, epoch, val_metrics.get("recon_loss", 0.0), val_recon_loss_ds, val_metrics["batches"])
+                        log_metric(writers, "valid/recon_loss", val_metrics.get("recon_loss", 0.0), step=global_step)
+                        for dsid, v in val_recon_loss_ds.items():
+                            log_metric(writers, "valid/recon_loss", v, step=global_step, head=dsid)
                     elif cfg.task == "clf":
                         val_clf_loss = val_metrics.get("clf_loss", {})
                         val_acc = val_metrics.get("acc", {})
@@ -1203,23 +1439,27 @@ def run_training(cfg: TrainConfig, args) -> None:
                             {f"{dsid}:{dsid_to_clf_name.get(dsid, dsid)}": float(v) for dsid, v in val_acc.items()} if isinstance(val_acc, dict) else float(val_acc),
                             val_metrics["batches"],
                         )
-                        log_metric(writers, "val/clf_loss", val_metrics.get("clf_loss", 0.0), step=global_step)
-                        log_metric(writers, "val/acc", val_metrics.get("acc", 0.0), step=global_step)
+                        log_metric(writers, "valid/clf_loss", val_metrics.get("clf_loss", 0.0), step=global_step)
+                        log_metric(writers, "valid/acc", val_metrics.get("acc", 0.0), step=global_step)
                     else:
                         val_clf_loss = val_metrics.get("clf_loss", {})
                         val_acc = val_metrics.get("acc", {})
+                        val_recon_loss_ds = val_metrics.get("recon_loss_ds", {})
                         logger.info(
-                            "fold=%d epoch=%d val_recon_loss=%.4f val_clf_loss=%s val_acc=%s batches=%d",
+                            "fold=%d epoch=%d val_recon_loss=%.4f val_recon_loss_ds=%s val_clf_loss=%s val_acc=%s batches=%d",
                             fold_idx + 1,
                             epoch,
                             val_metrics.get("recon_loss", 0.0),
+                            {dsid_to_clf_name.get(dsid, dsid): f"{v:.4f}" for dsid, v in val_recon_loss_ds.items()},
                             {f"{dsid}:{dsid_to_clf_name.get(dsid, dsid)}": float(v) for dsid, v in val_clf_loss.items()} if isinstance(val_clf_loss, dict) else float(val_clf_loss),
                             {f"{dsid}:{dsid_to_clf_name.get(dsid, dsid)}": float(v) for dsid, v in val_acc.items()} if isinstance(val_acc, dict) else float(val_acc),
                             val_metrics["batches"],
                         )
-                        log_metric(writers, "val/recon_loss", val_metrics.get("recon_loss", 0.0), step=global_step)
-                        log_metric(writers, "val/clf_loss", val_metrics.get("clf_loss", 0.0), step=global_step)
-                        log_metric(writers, "val/acc", val_metrics.get("acc", 0.0), step=global_step)
+                        log_metric(writers, "valid/recon_loss", val_metrics.get("recon_loss", 0.0), step=global_step)
+                        for dsid, v in val_recon_loss_ds.items():
+                            log_metric(writers, "valid/recon_loss", v, step=global_step, head=dsid)
+                        log_metric(writers, "valid/clf_loss", val_metrics.get("clf_loss", 0.0), step=global_step)
+                        log_metric(writers, "valid/acc", val_metrics.get("acc", 0.0), step=global_step)
 
                     global_step += 1
 
@@ -1228,11 +1468,10 @@ def run_training(cfg: TrainConfig, args) -> None:
                             best_score = val_score
                             epochs_no_improve = 0
                             best_states = (
-                                copy.deepcopy(model.state_dict()),
-                                copy.deepcopy(embed.state_dict()),
-                                copy.deepcopy(head_recon.state_dict()) if head_recon is not None else None,
-                                copy.deepcopy({dsid: head.state_dict() for dsid, head in head_clf.items()}) if head_clf is not None else None,
-                                copy.deepcopy(opt.state_dict()),
+                                _state_dict_to_cpu(model.state_dict()),
+                                _state_dict_to_cpu(embed.state_dict()),
+                                _state_dict_to_cpu(head_recon.state_dict()) if head_recon is not None else None,
+                                {dsid: _state_dict_to_cpu(head.state_dict()) for dsid, head in head_clf.items()} if head_clf is not None else None,
                             )
                         else:
                             epochs_no_improve += 1
@@ -1264,7 +1503,6 @@ def run_training(cfg: TrainConfig, args) -> None:
 
             # Always save a full-resume checkpoint each epoch for crash recovery.
             last_ckpt_path = os.path.join(checkpoint_dir, "last.pth")
-            fold_last_ckpt_path = os.path.join(checkpoint_dir, f"last_fold{fold_idx+1}.pth")
             resume_state = {
                 "model": model.state_dict(),
                 "embed": embed.state_dict(),
@@ -1281,8 +1519,7 @@ def run_training(cfg: TrainConfig, args) -> None:
                 "cfg": vars(cfg),
             }
             torch.save(resume_state, last_ckpt_path)
-            torch.save(resume_state, fold_last_ckpt_path)
-            logger.info("Saved resume checkpoint: %s", fold_last_ckpt_path)
+            logger.info("Saved resume checkpoint: %s", last_ckpt_path)
 
             if early_stop_triggered:
                 break
@@ -1293,7 +1530,7 @@ def run_training(cfg: TrainConfig, args) -> None:
 
         # restore best states if we early-stopped or simply to use best val model
         if best_states is not None and val_loader is not None:
-            model_state, embed_state, head_recon_state, head_clf_state, opt_state = best_states
+            model_state, embed_state, head_recon_state, head_clf_state = best_states
             model.load_state_dict(model_state)
             embed.load_state_dict(embed_state)
             if head_recon is not None and head_recon_state is not None:
@@ -1302,9 +1539,8 @@ def run_training(cfg: TrainConfig, args) -> None:
                 for k, v in head_clf_state.items():
                     if k in head_clf:
                         head_clf[k].load_state_dict(v)
-            opt.load_state_dict(opt_state)
-            # Save best checkpoint for this fold
-            best_ckpt_path = os.path.join(checkpoint_dir, f"best_fold{fold_idx+1}.pth")
+            # Save best checkpoint (stable filename, overwritten on improvements)
+            best_ckpt_path = os.path.join(checkpoint_dir, "best.pth")
             torch.save({
                 'model': model.state_dict(),
                 'embed': embed.state_dict(),
@@ -1312,7 +1548,7 @@ def run_training(cfg: TrainConfig, args) -> None:
                 'head_clf': {k: v.state_dict() for k, v in head_clf.items()} if head_clf else None,
                 'optimizer': opt.state_dict(),
             }, best_ckpt_path)
-            logger.info(f"Best checkpoint for fold {fold_idx+1} saved to {best_ckpt_path}")
+            logger.info("Best checkpoint saved to %s", best_ckpt_path)
 
         if device.type == "cuda":
             torch.cuda.empty_cache()
@@ -1341,6 +1577,162 @@ def run_training(cfg: TrainConfig, args) -> None:
             best_val_score_across_folds = min(best_val_score_across_folds, best_score)
 
     logger.info("Training complete")
+    
+    # --- Transductive Learning Phase (Optional) ---
+    if args.transductive and args.transductive_epochs > 0 and head_recon is not None:
+        logger.info("Starting transductive fine-tuning phase: union of val+test without labels")
+        # Combine val and test indices (only works if test_idx and val_idx exist)
+        transductive_idx = test_idx.copy()
+        if val_idx is not None and len(val_idx) > 0:
+            transductive_idx = np.concatenate([val_idx, test_idx])
+        
+        if len(transductive_idx) == 0:
+            logger.warning("Transductive phase skipped: no validation or test samples available")
+        else:
+            # Create transductive loader (reconstruction-only, no labels)
+            transductive_dataset = DocDataset(
+                tokens_idx,
+                tokens_val,
+                labels=None,  # No labels for transductive phase
+                sample_to_dataset=sample_to_dataset,
+                max_seq_len=args.max_seq_len,
+                chunk_overlap=args.chunk_overlap
+            )
+            transductive_loader = DataLoader(
+                torch.utils.data.Subset(transductive_dataset, transductive_idx.tolist()),
+                batch_size=cfg.batch_size,
+                shuffle=True,
+                collate_fn=collate_recon_with_dataset
+            )
+            
+            # Set model to train mode for transductive phase
+            model.train()
+            embed.train()
+            if head_recon is not None:
+                head_recon.train()
+            if head_clf is not None and isinstance(head_clf, dict):
+                for head in head_clf.values():
+                    head.train()
+            
+            # Build separate transductive optimizer
+            transductive_params = list(model.parameters()) + list(embed.parameters())
+            if head_recon is not None:
+                transductive_params += list(head_recon.parameters())
+            transductive_opt = torch.optim.Adam(transductive_params, lr=cfg.lr)
+            
+            logger.info(
+                "[transductive] Starting %d epochs on %d samples (val+test combined)",
+                args.transductive_epochs,
+                len(transductive_idx),
+            )
+            
+            for epoch in range(args.transductive_epochs):
+                recon_loss_sum = 0.0
+                recon_loss_sum_ds = defaultdict(float)
+                recon_count_ds = defaultdict(int)
+                batch_count = 0
+                pbar = tqdm(
+                    transductive_loader,
+                    desc=f"Transductive Epoch {epoch+1}/{args.transductive_epochs}",
+                    leave=False
+                )
+                step = 0
+                for idx, val, mask, batch_datasets in pbar:
+                    idx = idx.to(device)
+                    val = val.to(device)
+                    mask = mask.to(device)
+                    
+                    if autocast_device:
+                        with autocast(autocast_device):
+                            tok = embed(idx)
+                            out = model(tok)
+                            pred_recon = head_recon(out).squeeze(-1)
+                            masked_pred = pred_recon[mask]
+                            masked_val = val[mask]
+                            recon_loss = torch.mean((masked_pred - masked_val) ** 2)
+                    else:
+                        with autocast():
+                            tok = embed(idx)
+                            out = model(tok)
+                            pred_recon = head_recon(out).squeeze(-1)
+                            masked_pred = pred_recon[mask]
+                            masked_val = val[mask]
+                            recon_loss = torch.mean((masked_pred - masked_val) ** 2)
+                    
+                    transductive_opt.zero_grad()
+                    if scaler:
+                        scaler.scale(recon_loss).backward()
+                        scaler.step(transductive_opt)
+                        scaler.update()
+                    else:
+                        recon_loss.backward()
+                        transductive_opt.step()
+                    
+                    step += 1
+                    batch_count += 1
+                    recon_loss_sum += recon_loss.item()
+                    with torch.no_grad():
+                        pred_eval = pred_recon.detach()
+                        val_eval = val.detach()
+                        mask_eval = mask.detach()
+                        for i, dsid in enumerate(batch_datasets):
+                            dsid = str(dsid)
+                            s_mask = mask_eval[i]
+                            if s_mask.any():
+                                s_loss = torch.mean((pred_eval[i][s_mask] - val_eval[i][s_mask]) ** 2).item()
+                                recon_loss_sum_ds[dsid] += float(s_loss)
+                                recon_count_ds[dsid] += 1
+                    
+                    pbar.set_postfix({"recon_loss": f"{recon_loss.item():.4f}"})
+                    if args.n_steps_per_epoch is not None and step >= args.n_steps_per_epoch:
+                        break
+                
+                if batch_count:
+                    avg_recon_loss = recon_loss_sum / batch_count
+                    avg_recon_loss_ds = {
+                        dsid: recon_loss_sum_ds[dsid] / recon_count_ds[dsid]
+                        for dsid in recon_loss_sum_ds
+                        if recon_count_ds[dsid] > 0
+                    }
+                    logger.info(
+                        "[transductive] epoch=%d/%d recon_loss=%.4f batches=%d",
+                        epoch + 1,
+                        args.transductive_epochs,
+                        avg_recon_loss,
+                        batch_count,
+                    )
+                    if avg_recon_loss_ds:
+                        logger.info(
+                            "[transductive] epoch=%d recon_loss_ds=%s",
+                            epoch + 1,
+                            {dsid_to_clf_name.get(dsid, dsid): round(v, 4) for dsid, v in avg_recon_loss_ds.items()},
+                        )
+                    log_metric(writers, "transductive/recon_loss", avg_recon_loss, step=global_step)
+                    for dsid, value in avg_recon_loss_ds.items():
+                        log_metric(writers, "transductive/recon_loss", value, step=global_step, head=dsid)
+                    global_step += 1
+            
+            logger.info("Transductive fine-tuning phase complete")
+            
+            # Evaluate on original test set after transductive phase
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+            model.eval()
+            embed.eval()
+            if head_recon is not None:
+                head_recon.eval()
+            if head_clf is not None and isinstance(head_clf, dict):
+                for head in head_clf.values():
+                    head.eval()
+            test_metrics_post_transductive = runner.evaluate(test_loader, model, embed, head_recon, head_clf, ce_loss)
+            if test_metrics_post_transductive:
+                logger.info(
+                    "[transductive] post-transductive test results: recon_loss=%.4f clf_acc=%.4f batches=%d",
+                    test_metrics_post_transductive.get("recon_loss", 0.0),
+                    test_metrics_post_transductive.get("acc", {}).get(list(test_metrics_post_transductive.get("acc", {}).keys())[0], 0.0) if test_metrics_post_transductive.get("acc") else 0.0,
+                    test_metrics_post_transductive["batches"],
+                )
+    
     hparam_dict = {
         **preprocessing_params,
         "task": cfg.task,
@@ -1407,6 +1799,8 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--verbose", action="store_true", default=False, help="Enable verbose debug output")
     parser.add_argument("--warmup-scheduler", type=str, default=None, help="LR scheduler for warmup phase (e.g. 'cosine', 'step', 'none')")
     parser.add_argument("--main-scheduler", type=str, default=None, help="LR scheduler for main training phase (e.g. 'cosine', 'step', 'none'")
+    parser.add_argument("--transductive", action="store_true", default=False, help="Enable transductive fine-tuning phase after main training")
+    parser.add_argument("--transductive-epochs", type=int, default=10, help="Number of epochs for transductive fine-tuning (reconstruction-only on val+test combined)")
 
     return parser
 
